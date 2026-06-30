@@ -2,8 +2,7 @@
 """
 smeta_core.py
 Бизнес-логика приложения "Сметчик PRO", не зависящая от tkinter.
-Вынесена в отдельный модуль, чтобы её можно было покрыть тестами
-и проверять независимо от GUI.
+Вынесена в отдельный модуль.
 """
 import os
 import math
@@ -23,124 +22,116 @@ EMPTY_TOKENS = ("", "-", "0", "nan", "none", "NaN")
 # Базовые помощники
 # --------------------------------------------------------------------------
 def to_float(val, default=0.0):
-    """Надёжно парсит число, поддерживает запятую как десятичный разделитель.
-    Никогда не бросает исключение — при невозможности распознать число
-    возвращает default."""
-    if val is None:
-        return default
+    """Надёжно парсит число, поддерживает запятую как десятичный разделитель."""
+    if val is None: return default
     if isinstance(val, (int, float)):
-        if isinstance(val, float) and math.isnan(val):
-            return default
+        if isinstance(val, float) and math.isnan(val): return default
         return float(val)
     s = str(val).strip().replace('\xa0', '').replace(' ', '').replace(',', '.')
-    if s == "" or s.lower() in ("nan", "none", "-"):
-        return default
-    try:
-        return float(s)
-    except ValueError:
-        return default
+    if s == "" or s.lower() in ("nan", "none", "-"): return default
+    try: return float(s)
+    except ValueError: return default
 
-def is_section(name) -> bool:
-    return str(name).strip().startswith("РАЗДЕЛ:")
-
-def is_work(name) -> bool:
-    return str(name).strip().startswith("Работа:")
-
-def is_total(name) -> bool:
-    return str(name).strip().startswith("ИТОГО ПО УЗЛУ")
-
-def is_material(name) -> bool:
-    return str(name).strip().startswith(">")
+def is_section(name) -> bool: return str(name).strip().startswith("РАЗДЕЛ:")
+def is_work(name) -> bool: return str(name).strip().startswith("Работа:")
+def is_total(name) -> bool: return str(name).strip().startswith("ИТОГО ПО УЗЛУ")
+def is_material(name) -> bool: return str(name).strip().startswith("    > ") # Унифицировано 4 пробела
 
 def clean_name(name) -> str:
-    """Убирает служебные префиксы ('Работа:', '>', пробелы) из имени."""
+    """Убирает служебные префиксы ('Работа:', '    > ') из имени."""
     s = str(name).strip()
-    if s.startswith("Работа: "):
-        s = s[len("Работа: "):]
-    elif s.startswith(">"):
-        s = s[1:]
+    if s.startswith("Работа: "): s = s[len("Работа: "):]
+    elif s.startswith("    > "): s = s[4:]
     return s.strip()
 
 # --------------------------------------------------------------------------
 # Работа с базой (DataFrame)
 # --------------------------------------------------------------------------
 def migrate_legacy_df(df):
-    """Если в базе старый формат (один вариант цены) — переносит значения
-    в '_1' колонки и копирует их же в '_2', чтобы пользователь мог
-    дальше самостоятельно скорректировать второй вариант."""
+    """Если в базе старый формат (один вариант цены) — переносит значения в '_1' и копирует в '_2'."""
     has_legacy = all(c in df.columns for c in LEGACY_COLS)
     has_new = all(c in df.columns for c in COLS)
 
     if has_new:
         for c in COLS:
-            if c not in df.columns:
-                df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
+            if c not in df.columns: df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
         return df[COLS].copy()
 
     if has_legacy:
         out = df.copy()
-        out['Расход_1'] = out['Расход']
-        out['Цена_мат_1'] = out['Цена_мат']
-        out['Цена_раб_1'] = out['Цена_раб']
-        out['Расход_2'] = out['Расход']
-        out['Цена_мат_2'] = out['Цена_мат']
-        out['Цена_раб_2'] = out['Цена_раб']
+        out['Расход_1'] = out['Расход']; out['Цена_мат_1'] = out['Цена_мат']; out['Цена_раб_1'] = out['Цена_раб']
+        out['Расход_2'] = out['Расход']; out['Цена_мат_2'] = out['Цена_мат']; out['Цена_раб_2'] = out['Цена_раб']
         return out[COLS].copy()
 
     for c in COLS:
-        if c not in df.columns:
-            df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
+        if c not in df.columns: df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
     return df[COLS].copy()
 
-def build_work_block(work_name, vol, db, next_num):
-    """Строит строки сметы (работа + материалы + строка ИТОГО ПО УЗЛУ) для
-    добавления одной позиции работы с заданным объёмом."""
-    items = db[db['Работа'].astype(str).str.strip() == str(work_name).strip()]
-    if items.empty:
-        return None
-    first = items.iloc[0]
-    unit_w = str(first['Ед_изм_раб'])
-    price_w1 = to_float(first['Цена_раб_1'])
-    price_w2 = to_float(first['Цена_раб_2'])
-    vol = to_float(vol)
-
-    work_cost1 = round(vol * price_w1, 2)
-    work_cost2 = round(vol * price_w2, 2)
-
-    rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
-             "-", vol, price_w2, work_cost2)]
-
-    mat_total1 = 0.0
-    mat_total2 = 0.0
-    for _, r in items.iterrows():
-        mat_name = str(r['Материал']).strip()
-        if mat_name.lower() in (t.lower() for t in EMPTY_TOKENS):
-            continue
-        rashod1 = to_float(r['Расход_1']); price_m1 = to_float(r['Цена_мат_1'])
-        rashod2 = to_float(r['Расход_2']); price_m2 = to_float(r['Цена_мат_2'])
-        qty1 = round(rashod1 * vol, 3)
-        qty2 = round(rashod2 * vol, 3)
-        cost1 = round(qty1 * price_m1, 2)
-        cost2 = round(qty2 * price_m2, 2)
-        mat_total1 += cost1
-        mat_total2 += cost2
-        rows.append(("", f"    > {mat_name}", str(r['Ед_изм']), rashod1, qty1, price_m1, cost1,
-                     rashod2, qty2, price_m2, cost2))
-
-    combined1 = round(work_cost1 + mat_total1, 2)
-    combined2 = round(work_cost2 + mat_total2, 2)
-    rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
-                 "", "", "Сумма:", combined2))
-    return rows
+def build_work_block(work_name, vol, db, next_num, db_manager=None):
+    """Строит строки сметы (работа + материалы + строка ИТОГО ПО УЗЛУ)."""
+    if db_manager is not None:
+        work_data = db_manager.get_work_with_materials(work_name)
+        if work_data is None: return None
+        
+        work = work_data['work']; materials = work_data['materials']
+        unit_w = str(work['unit'])
+        price_w1 = to_float(work['price_1']); price_w2 = to_float(work['price_2'])
+        vol = to_float(vol)
+        
+        work_cost1 = round(vol * price_w1, 2); work_cost2 = round(vol * price_w2, 2)
+        rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
+                 "-", vol, price_w2, work_cost2)]
+        
+        mat_total1 = 0.0; mat_total2 = 0.0
+        for mat in materials:
+            mat_name = str(mat['name']).strip()
+            if mat_name.lower() in EMPTY_TOKENS: continue
+            rashod1 = to_float(mat['consumption_1']); price_m1 = to_float(mat['price_1'])
+            rashod2 = to_float(mat['consumption_2']); price_m2 = to_float(mat['price_2'])
+            qty1 = round(rashod1 * vol, 3); qty2 = round(rashod2 * vol, 3)
+            cost1 = round(qty1 * price_m1, 2); cost2 = round(qty2 * price_m2, 2)
+            mat_total1 += cost1; mat_total2 += cost2
+            rows.append(("", f"    > {mat_name}", str(mat['unit']), rashod1, qty1, price_m1, cost1,
+                         rashod2, qty2, price_m2, cost2))
+        
+        combined1 = round(work_cost1 + mat_total1, 2); combined2 = round(work_cost2 + mat_total2, 2)
+        rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
+                     "", "", "Сумма:", combined2))
+        return rows
+    else:
+        # Старый метод с DataFrame
+        items = db[db['Работа'].astype(str).str.strip() == str(work_name).strip()]
+        if items.empty: return None
+        first = items.iloc[0]
+        unit_w = str(first['Ед_изм_раб'])
+        price_w1 = to_float(first['Цена_раб_1']); price_w2 = to_float(first['Цена_раб_2'])
+        vol = to_float(vol)
+        
+        work_cost1 = round(vol * price_w1, 2); work_cost2 = round(vol * price_w2, 2)
+        rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
+                 "-", vol, price_w2, work_cost2)]
+        
+        mat_total1 = 0.0; mat_total2 = 0.0
+        for _, r in items.iterrows():
+            mat_name = str(r['Материал']).strip()
+            if mat_name.lower() in EMPTY_TOKENS: continue
+            rashod1 = to_float(r['Расход_1']); price_m1 = to_float(r['Цена_мат_1'])
+            rashod2 = to_float(r['Расход_2']); price_m2 = to_float(r['Цена_мат_2'])
+            qty1 = round(rashod1 * vol, 3); qty2 = round(rashod2 * vol, 3)
+            cost1 = round(qty1 * price_m1, 2); cost2 = round(qty2 * price_m2, 2)
+            mat_total1 += cost1; mat_total2 += cost2
+            rows.append(("", f"    > {mat_name}", str(r['Ед_изм']), rashod1, qty1, price_m1, cost1,
+                         rashod2, qty2, price_m2, cost2))
+        
+        combined1 = round(work_cost1 + mat_total1, 2); combined2 = round(work_cost2 + mat_total2, 2)
+        rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
+                     "", "", "Сумма:", combined2))
+        return rows
 
 def rebuild_smeta(rows):
-    """Полная пересборка сметы — единая точка пересчёта.
-    ✅ ИСПРАВЛЕНО: сохраняет ручные изменения объёма, если они отличаются от
-    автоматически рассчитанных (норма × объём работы)."""
+    """Полная пересборка сметы — единая точка пересчёта."""
     cleaned = [r for r in rows if not is_total(str(r[1]))]
-    out = []
-    next_num = 1
-    work_vol = 1.0
+    out = []; next_num = 1; work_vol = 1.0
     node_work_name = None
     node_work_cost1 = node_work_cost2 = 0.0
     node_mat_cost1 = node_mat_cost2 = 0.0
@@ -151,58 +142,38 @@ def rebuild_smeta(rows):
             out.append(("", f"ИТОГО ПО УЗЛУ: {node_work_name}", "", "", "", "Сумма:",
                         round(node_work_cost1 + node_mat_cost1, 2),
                         "", "", "Сумма:", round(node_work_cost2 + node_mat_cost2, 2)))
-        node_work_name = None
-        node_work_cost1 = node_work_cost2 = node_mat_cost1 = node_mat_cost2 = 0.0
+        node_work_name = None; node_work_cost1 = node_work_cost2 = node_mat_cost1 = node_mat_cost2 = 0.0
 
     for raw in cleaned:
-        vals = list(raw)
-        name = str(vals[1]).strip()
-
-        if is_section(name):
-            flush_node()
-            out.append(tuple(vals))
-            continue
+        vals = list(raw); name = str(vals[1]).strip()
+        if is_section(name): flush_node(); out.append(tuple(vals)); continue
 
         if is_work(name):
             flush_node()
-            # ✅ Обновляем объём только если он явно задан пользователем
             user_vol = to_float(vals[4], 0.0)
             work_vol = user_vol if user_vol > 0 else 1.0
             
-            price1 = to_float(vals[5])
-            price2 = to_float(vals[9])
-            vals[0] = next_num
-            next_num += 1
-            vals[4] = work_vol
-            vals[8] = work_vol
-            vals[6] = round(work_vol * price1, 2)
-            vals[10] = round(work_vol * price2, 2)
+            price1 = to_float(vals[5]); price2 = to_float(vals[9])
+            vals[0] = next_num; next_num += 1
+            vals[4] = work_vol; vals[8] = work_vol
+            vals[6] = round(work_vol * price1, 2); vals[10] = round(work_vol * price2, 2)
             node_work_name = name.replace("Работа: ", "").strip()
             node_work_cost1, node_work_cost2 = vals[6], vals[10]
-            out.append(tuple(vals))
-            continue
+            out.append(tuple(vals)); continue
 
         if is_material(name):
-            norm1 = to_float(vals[3])
-            norm2 = to_float(vals[7])
-            calc_qty1 = round(norm1 * work_vol, 3)
-            calc_qty2 = round(norm2 * work_vol, 3)
+            norm1 = to_float(vals[3]); norm2 = to_float(vals[7])
+            calc_qty1 = round(norm1 * work_vol, 3); calc_qty2 = round(norm2 * work_vol, 3)
             
-            # ✅ Сохраняем ручной объём, если он уже задан и не равен нулю
-            cur_qty1 = to_float(vals[4], 0.0)
-            cur_qty2 = to_float(vals[8], 0.0)
+            cur_qty1 = to_float(vals[4], 0.0); cur_qty2 = to_float(vals[8], 0.0)
             vals[4] = cur_qty1 if cur_qty1 > 0 else calc_qty1
             vals[8] = cur_qty2 if cur_qty2 > 0 else calc_qty2
 
-            price1 = to_float(vals[5])
-            price2 = to_float(vals[9])
+            price1 = to_float(vals[5]); price2 = to_float(vals[9])
             vals[0] = ""
-            vals[6] = round(vals[4] * price1, 2)
-            vals[10] = round(vals[8] * price2, 2)
-            node_mat_cost1 += vals[6]
-            node_mat_cost2 += vals[10]
-            out.append(tuple(vals))
-            continue
+            vals[6] = round(vals[4] * price1, 2); vals[10] = round(vals[8] * price2, 2)
+            node_mat_cost1 += vals[6]; node_mat_cost2 += vals[10]
+            out.append(tuple(vals)); continue
 
         out.append(tuple(vals))
 
@@ -214,36 +185,29 @@ def compute_grand_totals(rows):
     t1 = t2 = 0.0
     for vals in rows:
         name = str(vals[1]).strip()
-        if is_total(name):
-            t1 += to_float(vals[6])
-            t2 += to_float(vals[10])
+        if is_total(name): t1 += to_float(vals[6]); t2 += to_float(vals[10])
     return round(t1, 2), round(t2, 2)
 
 # --------------------------------------------------------------------------
 # Импорт ранее выгруженной сметы
 # --------------------------------------------------------------------------
 def parse_exported_sheet(sheet_values):
-    """Разбирает ранее экспортированный лист 'Смета' (список списков ячеек,
-    как возвращает pandas с header=None) и извлекает:
-    - список (work_name, vol) в порядке следования, для восстановления через базу
-    - список разделов с позицией вставки (индекс перед какой работой)
-    - заголовок сметы
-    - накладные/подъёмные (вариант1, вариант2), если найдены
-    """
+    """Разбирает ранее экспортированный лист 'Смета'."""
     import math
     
     title = ""
     overhead = (0.0, 0.0)
     lifting = (0.0, 0.0)
+    lifting_trash = (0.0, 0.0)
     sequence = []
-    
+
     # Заголовок сметы - ищем в первых строках
     if sheet_values:
         for row in sheet_values[:3]:
             for cell in row:
-                if cell and isinstance(cell, str) and len(cell.strip()) > 20:
-                    if "Смета" in cell or "смета" in cell:
-                        title = cell.strip()
+                if cell and isinstance(cell, str) and len(str(cell).strip()) > 20:
+                    if "Смета" in cell or "смета" in cell or "Коммерческое" in cell:
+                        title = str(cell).strip()
                         break
 
     for row_idx, row in enumerate(sheet_values): 
@@ -272,16 +236,16 @@ def parse_exported_sheet(sheet_values):
         # Пропускаем строки с номерами колонок (1, 2, 3, 4, 5, 6, 7)
         if str0.isdigit() and str1.isdigit() and int(str0) < 10 and int(str1) < 10:
             continue
-            
-        # Проверяем, является ли строка разделом (начинается с "РАЗДЕЛ:" или это заголовок раздела)
-        if str0.startswith("РАЗДЕЛ:") or (str0 and not str0.replace('.', '').isdigit() and not str1):
-            if str0 and len(str0) > 5 and not str0.replace('.', '').isdigit():
-                sequence.append(('section', str0.replace("РАЗДЕЛ:", "").strip()))
-                continue
+        
+        # Проверяем, является ли строка разделом (начинается с "РАЗДЕЛ:")
+        if str1.startswith("РАЗДЕЛ:") or (str0.startswith("РАЗДЕЛ:") and not str1):
+            section_text = str1 if str1.startswith("РАЗДЕЛ:") else str0
+            sequence.append(('section', section_text.replace("РАЗДЕЛ:", "").strip()))
+            continue
         
         # Если col1 пустой, но col0 содержит текст - это тоже может быть раздел
         if not str1 and str0 and not str0.replace('.', '').isdigit() and len(str0) > 3:
-            if "Гидроизоляция" in str0 or "Устройство" in str0 or "Монтаж" in str0:
+            if "Гидроизоляция" in str0 or "Устройство" in str0 or "Монтаж" in str0 or "Подготовка" in str0:
                 sequence.append(('section', str0))
                 continue
         
@@ -308,12 +272,21 @@ def parse_exported_sheet(sheet_values):
             except (ValueError, TypeError, IndexError):
                 pass
             continue
-            
+        
         if "Подъёмные" in name or "Подъемные" in name or "грузопод" in name.lower():
             try:
                 val1 = float(row[6]) if len(row) > 6 and not (isinstance(row[6], float) and math.isnan(row[6])) else 0.0
                 val2 = float(row[10]) if len(row) > 10 and not (isinstance(row[10], float) and math.isnan(row[10])) else 0.0
                 lifting = (val1, val2)
+            except (ValueError, TypeError, IndexError):
+                pass
+            continue
+            
+        if "вывоз" in name.lower() and "мусор" in name.lower():
+            try:
+                val1 = float(row[6]) if len(row) > 6 and not (isinstance(row[6], float) and math.isnan(row[6])) else 0.0
+                val2 = float(row[10]) if len(row) > 10 and not (isinstance(row[10], float) and math.isnan(row[10])) else 0.0
+                lifting_trash = (val1, val2)
             except (ValueError, TypeError, IndexError):
                 pass
             continue
@@ -335,6 +308,7 @@ def parse_exported_sheet(sheet_values):
         'title': title,
         'overhead': overhead,
         'lifting': lifting,
+        'lifting_trash': lifting_trash,
         'sequence': sequence,
     }
 
@@ -348,39 +322,23 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     wb = xlsxwriter.Workbook(output_path)
     ws = wb.add_worksheet("Смета")
 
-    f_title = wb.add_format({'bold': True, 'font_size': 12, 'align': 'center',
-                             'valign': 'vcenter', 'text_wrap': True, 'font_name': 'Arial'})
-    f_variant = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#BDD7EE',
-                               'align': 'center', 'font_name': 'Arial', 'font_size': 11})
-    f_header = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#D9E1F2', 'align': 'center',
-                              'valign': 'vcenter', 'text_wrap': True, 'font_name': 'Arial', 'font_size': 11})
-    f_section = wb.add_format({'bold': True, 'bg_color': '#E1BEE7', 'border': 1, 'align': 'left',
-                               'valign': 'vcenter', 'font_name': 'Arial', 'font_size': 11})
-    f_item_txt = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFF2CC',
-                                'text_wrap': True, 'font_name': 'Arial', 'font_size': 10})
-    f_item_ctr = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFF2CC',
-                                'align': 'center', 'font_name': 'Arial', 'font_size': 10})
-    f_item_num = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFF2CC', 'num_format': '#,##0.00',
-                                'align': 'right', 'font_name': 'Arial', 'font_size': 10})
-    f_break_txt = wb.add_format({'italic': True, 'border': 1, 'align': 'right',
-                                 'font_name': 'Arial', 'font_size': 10})
-    f_break_num = wb.add_format({'italic': True, 'border': 1, 'num_format': '#,##0.00',
-                                 'align': 'right', 'font_name': 'Arial', 'font_size': 10})
-    f_mat_txt = wb.add_format({'border': 1, 'indent': 1, 'text_wrap': True,
-                               'font_name': 'Arial', 'font_size': 10})
-    f_mat_num = wb.add_format({'border': 1, 'num_format': '#,##0.00', 'align': 'right',
-                               'font_name': 'Arial', 'font_size': 10})
+    f_title = wb.add_format({'bold': True, 'font_size': 12, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'font_name': 'Arial'})
+    f_variant = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#BDD7EE', 'align': 'center', 'font_name': 'Arial', 'font_size': 11})
+    f_header = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#D9E1F2', 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'font_name': 'Arial', 'font_size': 11})
+    f_section = wb.add_format({'bold': True, 'bg_color': '#E1BEE7', 'border': 1, 'align': 'left', 'valign': 'vcenter', 'font_name': 'Arial', 'font_size': 11})
+    f_item_txt = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFF2CC', 'text_wrap': True, 'font_name': 'Arial', 'font_size': 10})
+    f_item_ctr = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFF2CC', 'align': 'center', 'font_name': 'Arial', 'font_size': 10})
+    f_item_num = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFF2CC', 'num_format': '#,##0.00', 'align': 'right', 'font_name': 'Arial', 'font_size': 10})
+    f_break_txt = wb.add_format({'italic': True, 'border': 1, 'align': 'right', 'font_name': 'Arial', 'font_size': 10})
+    f_break_num = wb.add_format({'italic': True, 'border': 1, 'num_format': '#,##0.00', 'align': 'right', 'font_name': 'Arial', 'font_size': 10})
+    f_mat_txt = wb.add_format({'border': 1, 'indent': 1, 'text_wrap': True, 'font_name': 'Arial', 'font_size': 10})
+    f_mat_num = wb.add_format({'border': 1, 'num_format': '#,##0.00', 'align': 'right', 'font_name': 'Arial', 'font_size': 10})
     f_blank = wb.add_format({'border': 1, 'font_name': 'Arial', 'font_size': 10})
-    f_sub_lbl = wb.add_format({'bold': True, 'border': 1, 'align': 'left',
-                               'font_name': 'Arial', 'font_size': 11})
-    f_sub_num = wb.add_format({'bold': True, 'border': 1, 'num_format': '#,##0.00', 'align': 'right',
-                               'font_name': 'Arial', 'font_size': 11})
-    f_total_lbl = wb.add_format({'bold': True, 'border': 1, 'align': 'left', 'font_size': 12,
-                                 'font_name': 'Arial'})
-    f_total_num = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFCC00', 'num_format': '#,##0.00',
-                                 'align': 'right', 'font_name': 'Arial', 'font_size': 12})
-    f_ratio = wb.add_format({'border': 1, 'num_format': '0.000', 'align': 'right',
-                             'font_name': 'Arial', 'font_size': 10})
+    f_sub_lbl = wb.add_format({'bold': True, 'border': 1, 'align': 'left', 'font_name': 'Arial', 'font_size': 11})
+    f_sub_num = wb.add_format({'bold': True, 'border': 1, 'num_format': '#,##0.00', 'align': 'right', 'font_name': 'Arial', 'font_size': 11})
+    f_total_lbl = wb.add_format({'bold': True, 'border': 1, 'align': 'left', 'font_size': 12, 'font_name': 'Arial'})
+    f_total_num = wb.add_format({'bold': True, 'border': 1, 'bg_color': '#FFCC00', 'num_format': '#,##0.00', 'align': 'right', 'font_name': 'Arial', 'font_size': 12})
+    f_ratio = wb.add_format({'border': 1, 'num_format': '0.000', 'align': 'right', 'font_name': 'Arial', 'font_size': 10})
 
     ws.merge_range(0, 0, 0, 10, title or "Смета", f_title)
     ws.merge_range(1, 3, 1, 6, "ЦЕНА — ВАРИАНТ 1", f_variant)
@@ -389,8 +347,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     headers = ["№ п/п", "Наименование работ и затрат", "Ед. изм.",
                "Норма расхода", "Объём", "Цена за ед., руб.", "Сметная стоимость, руб.",
                "Норма расхода", "Объём", "Цена за ед., руб.", "Сметная стоимость, руб."]
-    for c, h in enumerate(headers):
-        ws.write(2, c, h, f_header)
+    for c, h in enumerate(headers): ws.write(2, c, h, f_header)
 
     ws.set_column(0, 0, 6); ws.set_column(1, 1, 52); ws.set_column(2, 2, 9)
     ws.set_column(3, 3, 11); ws.set_column(4, 4, 11); ws.set_column(5, 5, 13); ws.set_column(6, 6, 16)
@@ -398,62 +355,11 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     ws.freeze_panes(3, 2)
  
     excel_row = 3
-    i = 0
-    n = len(rows)
-
+    i = 0; n = len(rows)
     workonly_total1_refs, workonly_total2_refs = [], []
     matonly_total1_refs, matonly_total2_refs = [], []
     seen_work1, seen_work2 = {}, {}
     seen_mat1, seen_mat2 = {}, {}
-
-    # --- Итоги ---
-    row_gap = excel_row + 1
-    row_total = row_gap + 1
-    row_works = row_total + 1
-    row_mats = row_total + 2
-    row_overhead = row_total + 3
-    row_lifting = row_total + 4
-    row_trash = row_total + 5 # Новая строка для мусора
-
-    works_f1 = "+".join(workonly_total1_refs) if workonly_total1_refs else "0"
-    works_f2 = "+".join(workonly_total2_refs) if workonly_total2_refs else "0"
-    mats_f1 = "+".join(matonly_total1_refs) if matonly_total1_refs else "0"
-    mats_f2 = "+".join(matonly_total2_refs) if matonly_total2_refs else "0"
-
-    ws.write(row_works, 1, "в т.ч.: - работы:", f_sub_lbl)
-    ws.write_formula(row_works, 6, f"={works_f1}", f_sub_num)
-    ws.write_formula(row_works, 10, f"={works_f2}", f_sub_num)
-    ws.write_formula(row_works, 9, f"=IF({RC(row_works,6)}=0,0,{RC(row_works,10)}/{RC(row_works,6)})", f_ratio)
-
-    ws.write(row_mats, 1, "- материалы:", f_sub_lbl)
-    ws.write_formula(row_mats, 6, f"={mats_f1}", f_sub_num)
-    ws.write_formula(row_mats, 10, f"={mats_f2}", f_sub_num)
-    ws.write_formula(row_mats, 9, f"=IF({RC(row_mats,6)}=0,0,{RC(row_mats,10)}/{RC(row_mats,6)})", f_ratio)
-
-    ws.write(row_overhead, 1, "Накладные и транспортные расходы", f_sub_lbl)
-    ws.write(row_overhead, 6, overhead1, f_sub_num)
-    ws.write(row_overhead, 10, overhead2, f_sub_num)
-    ws.write_formula(row_overhead, 9, f"=IF({RC(row_overhead,6)}=0,0,{RC(row_overhead,10)}/{RC(row_overhead,6)})", f_ratio)
-
-    ws.write(row_lifting, 1, "Подъёмные механизмы", f_sub_lbl)
-    ws.write(row_lifting, 6, lift1, f_sub_num)
-    ws.write(row_lifting, 10, lift2, f_sub_num)
-    ws.write_formula(row_lifting, 9, f"=IF({RC(row_lifting,6)}=0,0,{RC(row_lifting,10)}/{RC(row_lifting,6)})", f_ratio)
-
-    # ✅ НОВОЕ: Вывоз мусора
-    ws.write(row_trash, 1, "Вывоз мусора", f_sub_lbl)
-    ws.write(row_trash, 6, trash1, f_sub_num)
-    ws.write(row_trash, 10, trash2, f_sub_num)
-    ws.write_formula(row_trash, 9, f"=IF({RC(row_trash,6)}=0,0,{RC(row_trash,10)}/{RC(row_trash,6)})", f_ratio)
-
-    ws.write(row_total, 1, "ИТОГО:", f_total_lbl)
-    # Формула теперь включает row_trash
-    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}+{RC(row_trash,6)}"
-    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}+{RC(row_trash,10)}"
-    ws.write_formula(row_total, 6, total_f1, f_total_num)
-    ws.write_formula(row_total, 10, total_f2, f_total_num)
-    ws.write_formula(row_total, 8, f"={RC(row_total,6)}-{RC(row_total,10)}", f_total_num)
-    ws.write_formula(row_total, 9, f"=IF({RC(row_total,6)}=0,0,{RC(row_total,10)}/{RC(row_total,6)})", f_ratio)
 
     def price_cell(seen_dict, key, row_idx, col_idx, value, fmt):
         if key not in seen_dict:
@@ -464,8 +370,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
             ws.write_formula(row_idx, col_idx, f"={RC(ref_row, ref_col)}", fmt, value)
 
     while i < n:
-        vals = rows[i]
-        name = str(vals[1]).strip()
+        vals = rows[i]; name = str(vals[1]).strip()
 
         if name.startswith("РАЗДЕЛ: "):
             section_title = name.replace("РАЗДЕЛ: ", "").strip()
@@ -480,9 +385,8 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
             vol = to_float(vals[4])
             price_w1 = to_float(vals[5]); price_w2 = to_float(vals[9])
 
-            j = i + 1
-            mats = []
-            while j < n and str(rows[j][1]).strip().startswith(">"):
+            j = i + 1; mats = []
+            while j < n and str(rows[j][1]).strip().startswith("    > "): # 4 пробела
                 mats.append(rows[j]); j += 1
 
             row_top = excel_row
@@ -519,20 +423,18 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
 
             ws.write_blank(row_matonly, 0, None, f_blank)
             ws.write(row_matonly, 1, "- материалы:", f_break_txt)
-            for c in (2, 3, 4, 5, 7, 8, 9):
-                ws.write_blank(row_matonly, c, None, f_blank)
+            for c in (2, 3, 4, 5, 7, 8, 9): ws.write_blank(row_matonly, c, None, f_blank)
             if mats:
                 ws.write_formula(row_matonly, 6, f"=SUM({RC(row_mat_start, 6)}:{RC(row_mat_end, 6)})", f_break_num)
                 ws.write_formula(row_matonly, 10, f"=SUM({RC(row_mat_start, 10)}:{RC(row_mat_end, 10)})", f_break_num)
             else:
-                ws.write(row_matonly, 6, 0, f_break_num)
-                ws.write(row_matonly, 10, 0, f_break_num)
+                ws.write(row_matonly, 6, 0, f_break_num); ws.write(row_matonly, 10, 0, f_break_num)
             matonly_total1_refs.append(RC(row_matonly, 6))
             matonly_total2_refs.append(RC(row_matonly, 10))
 
             for k, mvals in enumerate(mats):
                 r = row_mat_start + k
-                mat_name = str(mvals[1]).replace(">", "").strip()
+                mat_name = str(mvals[1]).replace("    > ", "").strip() # 4 пробела
                 unit_m = str(mvals[2])
                 norm1 = to_float(mvals[3]); norm2 = to_float(mvals[7])
 
@@ -564,6 +466,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     row_total = row_gap + 1
     row_works = row_total + 1; row_mats = row_total + 2
     row_overhead = row_total + 3; row_lifting = row_total + 4
+    row_trash = row_total + 5
 
     works_f1 = "+".join(workonly_total1_refs) if workonly_total1_refs else "0"
     works_f2 = "+".join(workonly_total2_refs) if workonly_total2_refs else "0"
@@ -590,9 +493,14 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     ws.write(row_lifting, 10, lift2, f_sub_num)
     ws.write_formula(row_lifting, 9, f"=IF({RC(row_lifting,6)}=0,0,{RC(row_lifting,10)}/{RC(row_lifting,6)})", f_ratio)
 
+    ws.write(row_trash, 1, "Вывоз мусора", f_sub_lbl)
+    ws.write(row_trash, 6, trash1, f_sub_num)
+    ws.write(row_trash, 10, trash2, f_sub_num)
+    ws.write_formula(row_trash, 9, f"=IF({RC(row_trash,6)}=0,0,{RC(row_trash,10)}/{RC(row_trash,6)})", f_ratio)
+
     ws.write(row_total, 1, "ИТОГО:", f_total_lbl)
-    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}"
-    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}"
+    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}+{RC(row_trash,6)}"
+    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}+{RC(row_trash,10)}"
     ws.write_formula(row_total, 6, total_f1, f_total_num)
     ws.write_formula(row_total, 10, total_f2, f_total_num)
     ws.write_formula(row_total, 8, f"={RC(row_total,6)}-{RC(row_total,10)}", f_total_num)

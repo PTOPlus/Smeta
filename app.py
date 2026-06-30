@@ -14,6 +14,13 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import smeta_core as sc
 
+# Попытка импорта менеджера базы данных
+try:
+    from db_manager import DatabaseManager
+    HAS_DB_MANAGER = True
+except ImportError:
+    HAS_DB_MANAGER = False
+
 SETTINGS_FILE = 'settings.json'
 
 # --------------------------------------------------------------------------
@@ -21,7 +28,7 @@ SETTINGS_FILE = 'settings.json'
 # --------------------------------------------------------------------------
 def load_settings():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_settings = {'db_folder': script_dir, 'export_folder': script_dir, 'active_db_filename': 'my_works_base.xlsx'}
+    default_settings = {'db_folder': script_dir, 'export_folder': script_dir, 'active_db_filename': 'smeta_db'}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -96,10 +103,21 @@ class SmetaApp:
         self.export_folder = settings['export_folder']
         self.active_db_filename = settings.get('active_db_filename', 'my_works_base.xlsx')
         self.db_file = os.path.join(self.db_folder, self.active_db_filename)
-
-        self.edit_entry = None; self.edit_item = None; self.edit_col_idx = None; self.edit_orig = None
-        self.undo_stack = []; self.ctx_menu_item = None; self.ctx_menu_col = None
-
+        
+        self.edit_entry = None
+        self.edit_item = None
+        self.edit_col_idx = None
+        self.edit_orig = None
+        self.undo_stack = []
+        self.ctx_menu_item = None
+        self.ctx_menu_col = None
+        
+        # Инициализируем db_manager для Parquet
+        self.db_manager = None
+        if HAS_DB_MANAGER:
+            db_name = self.active_db_filename.rsplit('.', 1)[0]
+            self.db_manager = DatabaseManager(self.db_folder, db_name)
+        
         self.db = self._load_db()
         self.sort_orders = {col: False for col in sc.COLS}
         self.display_cols = ['Работа', 'Ед_изм_раб', 'Цена_раб_1', 'Цена_раб_2',
@@ -119,7 +137,9 @@ class SmetaApp:
         self.notebook.add(self.tab_calc, text="Составление сметы")
         self.notebook.add(self.tab_db, text="Справочник")
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        self.setup_db_tab(); self.setup_calc_tab()
+        self.setup_db_tab()
+        self.setup_calc_tab()
+        self.refresh_db_list()  # Вызываем после полной инициализации всех виджетов
 
     def show_about(self):
         messagebox.showinfo("О программе", "Сметчик PRO 5.0\n\nПоддержка двух вариантов цены, учёт доп. расходов, автоматический расчёт экономии.")
@@ -154,20 +174,40 @@ class SmetaApp:
         messagebox.showinfo("Готово", "Настройки сохранены."); win.destroy()
 
     def _load_db(self):
-        if not os.path.exists(self.db_file): return pd.DataFrame(columns=sc.COLS)
-        try: raw = pd.read_excel(self.db_file)
+        # Проверяем Parquet файлы
+        if self.db_manager is not None:
+            return self.db_manager.get_legacy_dataframe()
+        
+        # Проверяем Excel файл
+        if not os.path.exists(self.db_file):
+            # Если нет Excel, но есть Parquet с таким же именем
+            parquet_file = self.db_file.replace('.xlsx', '_works.parquet')
+            if os.path.exists(parquet_file):
+                # Инициализируем db_manager для Parquet
+                db_name = self.active_db_filename.rsplit('.', 1)[0]
+                self.db_manager = DatabaseManager(self.db_folder, db_name)
+                return self.db_manager.get_legacy_dataframe()
+            return pd.DataFrame(columns=sc.COLS)
+        
+        try:
+            raw = pd.read_excel(self.db_file)
         except Exception as e:
             messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
             return pd.DataFrame(columns=sc.COLS)
-        is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS) and not all(c in raw.columns for c in sc.COLS))
+        
+        is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS)
+                        and not all(c in raw.columns for c in sc.COLS))
         migrated = sc.migrate_legacy_df(raw)
+        
         if is_legacy_only:
             try:
                 backup_path = self.db_file.rsplit('.', 1)[0] + "_backup_old_format.xlsx"
-                if not os.path.exists(backup_path): raw.to_excel(backup_path, index=False)
+                if not os.path.exists(backup_path):
+                    raw.to_excel(backup_path, index=False)
                 migrated.to_excel(self.db_file, index=False)
                 messagebox.showinfo("База обновлена", f"Формат обновлён. Резерв: {os.path.basename(backup_path)}")
-            except Exception as e: messagebox.showwarning("Внимание", f"Миграция в памяти успешна, но файл не сохранён:\n{e}")
+            except Exception as e:
+                messagebox.showwarning("Внимание", f"Миграция в памяти успешна, но файл не сохранён:\n{e}")
         return migrated
 
     def setup_db_tab(self):
@@ -177,7 +217,7 @@ class SmetaApp:
         tk.Button(db_sel_frame, text="➕ Создать", command=self.create_new_db).pack(side=tk.LEFT, padx=2)
         tk.Button(db_sel_frame, text="🗑 Удалить", command=self.delete_current_db).pack(side=tk.LEFT, padx=2)
         tk.Button(db_sel_frame, text="🔄 Обновить", command=self.refresh_db_list).pack(side=tk.LEFT, padx=2)
-        self.db_combo.bind("<<ComboboxSelected>>", self.on_db_selected); self.refresh_db_list()
+        self.db_combo.bind("<<ComboboxSelected>>", self.on_db_selected)
 
         frame_input = tk.LabelFrame(self.tab_db, text="Редактор базы", padx=10, pady=10); frame_input.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(frame_input, text="Наименование работы:").grid(row=0, column=0, sticky="nw")
@@ -210,23 +250,17 @@ class SmetaApp:
         tk.Button(filter_frame, text="Сброс", command=self.clear_db_filters).pack(side=tk.RIGHT, padx=5)
         self.filter_work.bind('<KeyRelease>', lambda e: self.refresh_db_table())
         self.filter_mat.bind('<KeyRelease>', lambda e: self.refresh_db_table())
-        # Фрейм-контейнер для дерева и скроллбара (сохраняет ваши отступы)
+        
         db_tree_frame = tk.Frame(self.tab_db)
         db_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
         self.tree_db = ttk.Treeview(db_tree_frame, columns=self.display_cols, show='headings')
         for c in self.display_cols:
             self.tree_db.heading(c, text=c, command=lambda _col=c: self.sort_column(_col))
-            width = 250 if c == "Работа" else 100 if "Цена" in c else 80
-            self.tree_db.column(c, width=width)
-
-        # 🔽 Вертикальная полоса прокрутки
+            self.tree_db.column(c, width=250 if c == "Работа" else 100 if "Цена" in c else 80)
         db_yscroll = ttk.Scrollbar(db_tree_frame, orient="vertical", command=self.tree_db.yview)
         self.tree_db.configure(yscrollcommand=db_yscroll.set)
-
         self.tree_db.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         db_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-
         self.tree_db.bind("<<TreeviewSelect>>", self.load_to_entries)
         self.refresh_db_table()
 
@@ -246,11 +280,34 @@ class SmetaApp:
                 raw = self.entries[nf].get().strip()
                 data[nf] = 0.0 if raw == "" else float(raw.replace(',', '.'))
             work_name = data['Работа']
-            mask = ((self.db['Работа'].astype(str).str.strip() == work_name) & (self.db['Материал'].astype(str).str.strip() == data['Материал']))
-            self.db = self.db[~mask].reset_index(drop=True)
-            self.db = pd.concat([self.db, pd.DataFrame([data])[sc.COLS]], ignore_index=True)
-            os.makedirs(self.db_folder, exist_ok=True)
-            self.db.to_excel(self.db_file, index=False)
+            
+            if self.db_manager is not None:
+                # Используем нормализованную БД
+                work = self.db_manager.get_work_by_name(work_name)
+                if work is None:
+                    work_id = self.db_manager.add_work(work_name, data['Ед_изм_раб'], data['Цена_раб_1'], data['Цена_раб_2'])
+                else:
+                    work_id = work['id']
+                    self.db_manager.update_work(work_id, unit=data['Ед_изм_раб'], price_1=data['Цена_раб_1'], price_2=data['Цена_раб_2'])
+                
+                mat_name = data['Материал']
+                if mat_name != "-":
+                    mat = self.db_manager.get_material_by_name(mat_name)
+                    if mat is None:
+                        mat_id = self.db_manager.add_material(mat_name, data['Ед_изм'], data['Цена_мат_1'], data['Цена_мат_2'])
+                    else:
+                        mat_id = mat['id']
+                        self.db_manager.update_material(mat_id, unit=data['Ед_изм'], price_1=data['Цена_мат_1'], price_2=data['Цена_мат_2'])
+                    self.db_manager.add_work_material_link(work_id, mat_id, data['Расход_1'], data['Расход_2'])
+                self.db_manager.flush()
+            else:
+                # Старый метод с Excel
+                mask = ((self.db['Работа'].astype(str).str.strip() == work_name) & (self.db['Материал'].astype(str).str.strip() == data['Материал']))
+                self.db = self.db[~mask].reset_index(drop=True)
+                self.db = pd.concat([self.db, pd.DataFrame([data])[sc.COLS]], ignore_index=True)
+                os.makedirs(self.db_folder, exist_ok=True)
+                self.db.to_excel(self.db_file, index=False)
+            
             self.refresh_db_table(); self.update_combobox()
             messagebox.showinfo("Готово", "Запись сохранена в базе.")
             self.refresh_estimate_if_needed(work_name)
@@ -266,7 +323,7 @@ class SmetaApp:
             vals = rows[i]; name = str(vals[1]).strip()
             if sc.is_work(name) and sc.clean_name(name) == work_name:
                 vol = sc.to_float(vals[4], 1.0)
-                block = sc.build_work_block(work_name, vol, self.db, 1)
+                block = sc.build_work_block(work_name, vol, self.db, 1, self.db_manager)
                 if block: new_rows.extend(block)
                 i += 1
                 while i < n and (sc.is_material(str(rows[i][1])) or sc.is_total(str(rows[i][1]))): i += 1
@@ -284,15 +341,22 @@ class SmetaApp:
         if not messagebox.askyesno("Подтверждение", "Удалить выбранную запись из базы?"): return
         try:
             idx_to_delete = int(sel[0])
-            if idx_to_delete in self.db.index:
-                self.db = self.db.drop(index=idx_to_delete).reset_index(drop=True)
-                os.makedirs(self.db_folder, exist_ok=True); self.db.to_excel(self.db_file, index=False)
-                self.refresh_db_table(); self.update_combobox()
-                messagebox.showinfo("Готово", "Запись удалена.")
-            else: messagebox.showerror("Ошибка", "Индекс строки не найден в базе.")
+            if self.db_manager is not None:
+                work_id = self.db.iloc[idx_to_delete]['id'] if 'id' in self.db.columns else None
+                if work_id: self.db_manager.delete_work(work_id)
+                self.db_manager.flush()
+                self.db = self.db_manager.get_legacy_dataframe()
+            else:
+                if idx_to_delete in self.db.index:
+                    self.db = self.db.drop(index=idx_to_delete).reset_index(drop=True)
+                    os.makedirs(self.db_folder, exist_ok=True); self.db.to_excel(self.db_file, index=False)
+            self.refresh_db_table(); self.update_combobox()
+            messagebox.showinfo("Готово", "Запись удалена.")
         except Exception as e: messagebox.showerror("Ошибка", f"Не удалось удалить запись:\n{e}")
 
     def refresh_db_table(self):
+        if not hasattr(self, 'tree_db'):
+            return
         self.tree_db.delete(*self.tree_db.get_children())
         df = self.db.copy()
         work_q = self.filter_work.get().strip().lower(); mat_q = self.filter_mat.get().strip().lower()
@@ -311,6 +375,8 @@ class SmetaApp:
         for c in sc.COLS[1:]: self.entries[c].delete(0, tk.END); self.entries[c].insert(0, row[c])
 
     def update_combobox(self):
+        if not hasattr(self, 'work_combo'):
+            return
         if not self.db.empty:
             self.all_works_list = sorted(list(self.db['Работа'].astype(str).unique()))
             self.work_combo['values'] = self.all_works_list
@@ -326,18 +392,42 @@ class SmetaApp:
         self.work_combo['values'] = filtered; self.work_combo.icursor(tk.END)
 
     def refresh_db_list(self):
-        if not os.path.exists(self.db_folder): os.makedirs(self.db_folder, exist_ok=True)
-        files = sorted([f for f in os.listdir(self.db_folder) if f.lower().endswith('.xlsx')])
-        self.db_combo['values'] = files
-        if self.active_db_filename in files: self.db_combo.set(self.active_db_filename)
-        elif files: self.db_combo.set(files[0]); self.on_db_selected()
+        if not os.path.exists(self.db_folder):
+            os.makedirs(self.db_folder, exist_ok=True)
+        
+        # Ищем и Excel, и Parquet файлы
+        files = sorted([
+            f for f in os.listdir(self.db_folder) 
+            if f.lower().endswith(('.xlsx', '.parquet'))
+        ])
+        
+        # Убираем дубликаты (если есть и xlsx, и parquet с одинаковым именем)
+        unique_files = []
+        seen_names = set()
+        for f in files:
+            name = f.rsplit('.', 1)[0]  # Убираем расширение
+            if name not in seen_names:
+                unique_files.append(f)
+                seen_names.add(name)
+        
+        # Очищаем список перед заполнением
+        self.db_combo['values'] = unique_files
+        
+        if self.active_db_filename in unique_files:
+            self.db_combo.set(self.active_db_filename)
+        elif unique_files:
+            self.db_combo.set(unique_files[0])
+            self.on_db_selected()
 
     def on_db_selected(self, event=None):
         new_db = self.db_combo.get()
         if new_db and new_db != self.active_db_filename:
-            self.active_db_filename = new_db; self.db_file = os.path.join(self.db_folder, new_db)
-            self._save_active_db_to_settings(); self.db = self._load_db()
-            self.refresh_db_table(); self.update_combobox()
+            self.active_db_filename = new_db
+            self.db_file = os.path.join(self.db_folder, new_db)
+            self._save_active_db_to_settings()
+            self.db = self._load_db()
+            self.refresh_db_table()
+            self.update_combobox()
 
     def _save_active_db_to_settings(self):
         settings = load_settings(); settings['active_db_filename'] = self.active_db_filename; save_settings(settings)
@@ -345,12 +435,19 @@ class SmetaApp:
     def create_new_db(self):
         new_name = simpledialog.askstring("Новая база", "Введите имя файла (например, База_Кровля.xlsx):")
         if not new_name: return
-        # ✅ ФИКС: санитизация имени файла
         new_name = re.sub(r'[<>:"/\\|?*]', '_', new_name)
         if not new_name.lower().endswith('.xlsx'): new_name += '.xlsx'
         new_path = os.path.join(self.db_folder, new_name)
         if os.path.exists(new_path): return messagebox.showwarning("Внимание", "Файл уже существует.")
-        pd.DataFrame(columns=sc.COLS).to_excel(new_path, index=False)
+        
+        if self.db_manager:
+            # Создаем новую БД через менеджер
+            db_name = new_name.replace('.xlsx', '')
+            self.active_db_filename = db_name
+            self.db_manager = DatabaseManager(self.db_folder, db_name)
+        else:
+            pd.DataFrame(columns=sc.COLS).to_excel(new_path, index=False)
+        
         self.refresh_db_list(); self.db_combo.set(new_name); self.on_db_selected()
         messagebox.showinfo("Готово", f"База «{new_name}» создана и загружена.")
 
@@ -359,7 +456,10 @@ class SmetaApp:
         if not messagebox.askyesno("Подтверждение", f"Удалить базу «{self.active_db_filename}»?\nЭто действие нельзя отменить."): return
         path = os.path.join(self.db_folder, self.active_db_filename)
         try:
-            os.remove(path); self.refresh_db_list()
+            os.remove(path)
+            if self.db_manager:
+                self.db_manager = None # Сброс менеджера
+            self.refresh_db_list()
             if self.db_combo['values']: self.db_combo.set(self.db_combo['values'][0]); self.on_db_selected()
             else: self.db = pd.DataFrame(columns=sc.COLS); self.refresh_db_table(); self.update_combobox()
             messagebox.showinfo("Готово", "База удалена.")
@@ -382,46 +482,29 @@ class SmetaApp:
         tk.Button(frame_tools, text="➕ Материал", bg="#4CAF50", fg="white", command=self.add_material_to_selected).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_tools, text="📋 Дубль мат.", bg="#FF9800", fg="white", command=self.duplicate_material).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_tools, text="🗑 Удалить", bg="#f44336", fg="white", command=self.remove_smeta_row).pack(side=tk.LEFT, padx=5)
-        self.calc_cols = sc.CALC_HEADERS
-
-        # Фрейм-контейнер для дерева и скроллбара
+        
         calc_tree_frame = tk.Frame(self.tab_calc)
         calc_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        # Увеличиваем высоту строк (применяется ко всему дереву сметы)
-        style = ttk.Style()
-        style.configure("Smeta.Treeview", rowheight=30)
-
-        self.tree_smeta = ttk.Treeview(
-            calc_tree_frame, 
-            columns=self.calc_cols, 
-            show='headings', 
-            selectmode='extended',
-            style="Smeta.Treeview"  # 👈 Применяем стиль с увеличенной высотой
-        )
+        self.calc_cols = sc.CALC_HEADERS
+        self.tree_smeta = ttk.Treeview(calc_tree_frame, columns=self.calc_cols, show='headings', selectmode='extended')
         widths = {"№": 45, "Наименование": 380, "Ед. изм.": 65}
         for c in self.calc_cols:
             self.tree_smeta.heading(c, text=c)
-            self.tree_smeta.column(c, width=widths.get(c, 90),
-                                    anchor="w" if c == "Наименование" else "center")
-
-        # 🔽 Вертикальная полоса прокрутки
+            self.tree_smeta.column(c, width=widths.get(c, 90), anchor="w" if c == "Наименование" else "center")
         calc_yscroll = ttk.Scrollbar(calc_tree_frame, orient="vertical", command=self.tree_smeta.yview)
         self.tree_smeta.configure(yscrollcommand=calc_yscroll.set)
         self.tree_smeta.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         calc_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-
+        
         self.tree_smeta.tag_configure("section", background="#E1BEE7", font=("Arial", 10, "bold"))
         self.tree_smeta.bind("<Double-1>", self.on_tree_double_click)
         self.tree_smeta.bind("<Control-z>", self.undo_action)
         self.tree_smeta.bind("<Button-3>", self._show_context_menu)
         
-        # 👇 Привязки для всплывающей подсказки полного текста
-        self._tooltip_win = None
-        self.tree_smeta.bind("<Motion>", self._show_name_tooltip)
-        self.tree_smeta.bind("<Leave>", self._hide_tooltip)
         frame_bottom = tk.Frame(self.tab_calc, pady=5); frame_bottom.pack(fill=tk.X, padx=10)
         tk.Button(frame_bottom, text="📂 Загрузить смету", bg="#607D8B", fg="white", command=self.load_estimate).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_bottom, text="Выгрузить в Excel", bg="#FF9800", fg="white", command=self.export_excel).pack(side=tk.LEFT, padx=5)
+        
         frame_extra = tk.LabelFrame(self.tab_calc, text="Доп. расходы (учитываются в ИТОГО)", padx=8, pady=4)
         frame_extra.pack(fill=tk.X, padx=10, pady=3)
         self.extra_entries = {}
@@ -432,12 +515,11 @@ class SmetaApp:
         ]
         for label, key in specs:
             tk.Label(frame_extra, text=label).pack(side=tk.LEFT, padx=(4, 2))
-            en = tk.Entry(frame_extra, width=12)
-            add_clipboard_support(en); add_context_menu(en)
-            en.insert(0, "0")
-            en.pack(side=tk.LEFT, padx=2)
+            en = tk.Entry(frame_extra, width=12); add_clipboard_support(en); add_context_menu(en)
+            en.insert(0, "0"); en.pack(side=tk.LEFT, padx=2)
             en.bind('<KeyRelease>', lambda e: self.update_total_sum())
             self.extra_entries[key] = en
+            
         total_frame = tk.Frame(self.tab_calc); total_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
         tk.Label(total_frame, text=" ").pack(side=tk.LEFT, expand=True)
         self.total_label = tk.Label(total_frame, text="ИТОГО В1: 0.00 ₽   |   ИТОГО В2: 0.00 ₽   |   Экономия: 0.00 ₽ (0.0%)", font=("Arial", 13, "bold"), fg="#1565C0")
@@ -489,7 +571,7 @@ class SmetaApp:
         next_num = 1
         for vals in rows:
             if vals and str(vals[0]).strip().isdigit(): next_num = max(next_num, int(vals[0]) + 1)
-        block = sc.build_work_block(work_name, volume, self.db, next_num)
+        block = sc.build_work_block(work_name, volume, self.db, next_num, self.db_manager)
         if block is None: return messagebox.showwarning("Внимание", f"Работа «{work_name}» не найдена в базе!")
         for vals in block: self.tree_smeta.insert("", tk.END, values=vals)
         if not suppress_total_update: self.update_total_sum()
@@ -507,27 +589,17 @@ class SmetaApp:
     def update_total_sum(self):
         rows = self._gather_rows()
         t1, t2 = sc.compute_grand_totals(rows)
+        oh1 = sc.to_float(self.extra_entries['overhead1'].get()) if hasattr(self, 'extra_entries') else 0.0
+        oh2 = sc.to_float(self.extra_entries['overhead2'].get()) if hasattr(self, 'extra_entries') else 0.0
+        l1 = sc.to_float(self.extra_entries['lift1'].get()) if hasattr(self, 'extra_entries') else 0.0
+        l2 = sc.to_float(self.extra_entries['lift2'].get()) if hasattr(self, 'extra_entries') else 0.0
+        tr1 = sc.to_float(self.extra_entries['trash1'].get()) if hasattr(self, 'extra_entries') else 0.0
+        tr2 = sc.to_float(self.extra_entries['trash2'].get()) if hasattr(self, 'extra_entries') else 0.0
         
-        # Чтение всех доп. расходов с защитой от ошибок
-        oh1 = sc.to_float(self.extra_entries.get('overhead1', {}).get())
-        oh2 = sc.to_float(self.extra_entries.get('overhead2', {}).get())
-        l1 = sc.to_float(self.extra_entries.get('lift1', {}).get())
-        l2 = sc.to_float(self.extra_entries.get('lift2', {}).get())
-        tr1 = sc.to_float(self.extra_entries.get('trash1', {}).get())
-        tr2 = sc.to_float(self.extra_entries.get('trash2', {}).get())
-
-        grand1 = round(t1 + oh1 + l1 + tr1, 2)
-        grand2 = round(t2 + oh2 + l2 + tr2, 2)
-        saving = round(grand1 - grand2, 2)
-        pct = (saving / grand1 * 100.0) if grand1 else 0.0
-
-        def fmt(v):
-            return format(v, ',.2f').replace(',', ' ')
-
-        self.total_label.config(
-            text=f"ИТОГО В1: {fmt(grand1)} ₽   |   ИТОГО В2: {fmt(grand2)} ₽   |   "
-                 f"Экономия: {fmt(saving)} ₽ ({pct:.1f}%)"
-        )
+        grand1 = round(t1 + oh1 + l1 + tr1, 2); grand2 = round(t2 + oh2 + l2 + tr2, 2)
+        saving = round(grand1 - grand2, 2); pct = (saving / grand1 * 100.0) if grand1 else 0.0
+        def fmt(v): return format(v, ',.2f').replace(',', ' ')
+        self.total_label.config(text=f"ИТОГО В1: {fmt(grand1)} ₽   |   ИТОГО В2: {fmt(grand2)} ₽   |   Экономия: {fmt(saving)} ₽ ({pct:.1f}%)")
         self.root.update_idletasks()
 
     def _edit_section_inline(self, item, vals):
@@ -582,8 +654,8 @@ class SmetaApp:
         else: nvals[self.edit_col_idx] = nv
         if self.edit_col_idx == 1:
             orig = str(self.edit_orig[1]).strip()
-            clean = str(nvals[1]).replace("Работа: ", "").replace(">", "").strip()
-            if orig.startswith(">"): nvals[1] = f"    > {clean}"
+            clean = str(nvals[1]).replace("Работа: ", "").replace("    > ", "").strip()
+            if orig.startswith("    > "): nvals[1] = f"    > {clean}"
             elif orig.startswith("Работа: "): nvals[1] = f"Работа: {clean}"
         self.tree_smeta.item(self.edit_item, values=tuple(nvals))
         self._sync_db(nvals, self.edit_col_idx)
@@ -596,13 +668,13 @@ class SmetaApp:
         if col_idx not in (3, 5, 7, 9): return
         orig_name = str(self.edit_orig[1]).strip()
         is_work_row = orig_name.startswith("Работа: ")
-        is_mat_row = orig_name.startswith(">")
+        is_mat_row = orig_name.startswith("    > ")
         if not (is_work_row or is_mat_row): return
         clean = sc.clean_name(orig_name); new_val = nvals[col_idx]
         for item in self.tree_smeta.get_children():
             if item == self.edit_item: continue
             vals = list(self.tree_smeta.item(item, 'values')); v_name = str(vals[1]).strip()
-            same_type = ((is_work_row and v_name.startswith("Работа: ")) or (is_mat_row and v_name.startswith(">")))
+            same_type = ((is_work_row and v_name.startswith("Работа: ")) or (is_mat_row and v_name.startswith("    > ")))
             if not same_type: continue
             if sc.clean_name(v_name) == clean:
                 vals[col_idx] = new_val; self.tree_smeta.item(item, values=tuple(vals))
@@ -610,75 +682,31 @@ class SmetaApp:
     def _sync_db(self, nv, col_idx):
         ov = str(self.edit_orig[1]).strip()
         is_work_row = ov.startswith("Работа: ")
-        is_mat_row = ov.startswith(">")
+        is_mat_row = ov.startswith("    > ")
         clean = sc.clean_name(ov)
-        col_map_mat = {3: 'Расход_1', 5: 'Цена_мат_1', 7: 'Расход_2', 9: 'Цена_мат_2'}
-        col_map_work = {5: 'Цена_раб_1', 9: 'Цена_раб_2'}
+        col_map_mat = {3: 'consumption_1', 5: 'price_1', 7: 'consumption_2', 9: 'price_2'}
+        col_map_work = {5: 'price_1', 9: 'price_2'}
         try:
+            if self.db_manager is None: return
             if col_idx == 1:
-                nc = str(nv[1]).replace("Работа: ", "").replace(">", "").strip()
-                if is_work_row: self.db.loc[self.db['Работа'].astype(str).str.strip() == clean, 'Работа'] = nc
-                elif is_mat_row: self.db.loc[self.db['Материал'].astype(str).str.strip() == clean, 'Материал'] = nc
+                nc = str(nv[1]).replace("Работа: ", "").replace("    > ", "").strip()
+                if is_work_row: self.db_manager.works_cache.loc[self.db_manager.works_cache['name'].str.strip() == clean, 'name'] = nc
+                elif is_mat_row: self.db_manager.materials_cache.loc[self.db_manager.materials_cache['name'].str.strip() == clean, 'name'] = nc
+                self.db_manager.works_dirty = True; self.db_manager.materials_dirty = True
             elif is_mat_row and col_idx in col_map_mat:
-                self.db.loc[self.db['Материал'].astype(str).str.strip() == clean, col_map_mat[col_idx]] = sc.to_float(nv[col_idx])
+                self.db_manager.work_materials_cache.loc[self.db_manager.work_materials_cache['material_id'] == self.db_manager.get_material_by_name(clean)['id'], col_map_mat[col_idx]] = sc.to_float(nv[col_idx])
+                self.db_manager.work_materials_dirty = True
             elif is_work_row and col_idx in col_map_work:
-                self.db.loc[self.db['Работа'].astype(str).str.strip() == clean, col_map_work[col_idx]] = sc.to_float(nv[col_idx])
+                self.db_manager.works_cache.loc[self.db_manager.works_cache['name'].str.strip() == clean, col_map_work[col_idx]] = sc.to_float(nv[col_idx])
+                self.db_manager.works_dirty = True
             else: return
-            self.db.to_excel(self.db_file, index=False); self.refresh_db_table(); self.update_combobox()
+            self.db_manager.flush()
+            self.refresh_db_table(); self.update_combobox()
         except Exception as e: messagebox.showerror("Ошибка БД", str(e))
 
     def _destroy_edit(self):
         if self.edit_entry is not None and self.edit_entry.winfo_exists(): self.edit_entry.destroy()
         self.edit_entry = None; self.edit_item = None; self.edit_col_idx = None; self.edit_orig = None
-
-    def _show_name_tooltip(self, event):
-        """Показывает всплывающее окно с полным текстом, если он длинный."""
-        item = self.tree_smeta.identify_row(event.y)
-        col = self.tree_smeta.identify_column(event.x)
-        
-        # Срабатывает только на колонку "Наименование" (#2)
-        if not item or col != '#2':
-            self._hide_tooltip()
-            return
-            
-        vals = self.tree_smeta.item(item, 'values')
-        if not vals: 
-            self._hide_tooltip()
-            return
-            
-        text = str(vals[1])
-        # Показываем подсказку только если текст > 45 символов (не помещается визуально)
-        if len(text) <= 45:
-            self._hide_tooltip()
-            return
-
-        self._hide_tooltip()
-        self._tooltip_win = tk.Toplevel(self.root)
-        self._tooltip_win.wm_overrideredirect(True)  # Без рамок и заголовка
-        self._tooltip_win.wm_geometry(f"+{event.x_root+15}+{event.y_root+15}")
-        self._tooltip_win.attributes("-topmost", True)
-        
-        tk.Label(
-            self._tooltip_win, 
-            text=text, 
-            background="#ffffdd", 
-            relief="solid", 
-            borderwidth=1,
-            wraplength=500, 
-            justify="left", 
-            font=("Arial", 11),
-            padx=8, pady=4
-        ).pack()
-
-    def _hide_tooltip(self, event=None):
-        """Безопасно скрывает подсказку."""
-        if hasattr(self, '_tooltip_win') and self._tooltip_win is not None:
-            try:
-                self._tooltip_win.destroy()
-            except tk.TclError:
-                pass
-            finally:
-                self._tooltip_win = None
 
     def _open_material_dialog(self, initial_data=None):
         win = tk.Toplevel(self.root); win.title("Добавить материал"); win.resizable(False, False)
@@ -724,7 +752,7 @@ class SmetaApp:
         sel = self.tree_smeta.selection()
         if not sel: return messagebox.showwarning("Внимание", "Выберите строку материала.")
         item = sel[0]; vals = list(self.tree_smeta.item(item, 'values')); name_raw = str(vals[1]).strip()
-        if not name_raw.startswith(">"): return messagebox.showwarning("Внимание", "Выбрана не строка материала.")
+        if not name_raw.startswith("    > "): return messagebox.showwarning("Внимание", "Выбрана не строка материала.")
         children = list(self.tree_smeta.get_children()); insert_idx = children.index(item) + 1
         self.tree_smeta.insert("", insert_idx, values=tuple(vals)); self.full_rebuild()
 
@@ -747,28 +775,18 @@ class SmetaApp:
         missing = []
         for entry in res['sequence']:
             if entry[0] == 'section':
-                self.tree_smeta.insert(
-                    "", tk.END,
-                    values=("", f"РАЗДЕЛ: {entry[1]}", "", "", "", "", "", "", "", "", ""),
-                    tags=("section",),
-                )
+                self.tree_smeta.insert("", tk.END, values=("", f"РАЗДЕЛ: {entry[1]}", "", "", "", "", "", "", "", "", ""), tags=("section",))
             else:
                 _, name, vol = entry
-                # Очищаем имя перед поиском и передаём в функцию чистое название
-                clean = sc.clean_name(name)
-                if (self.db['Работа'].astype(str).str.strip() == clean).any():
-                    self._add_work_to_smeta(clean, vol, suppress_total_update=True)
-                else:
-                    missing.append(clean)
-        oh1, oh2 = res['overhead']
-        l1, l2 = res['lifting']
-        lt1, lt2 = res.get('lifting_trash', (0.0, 0.0)) # Получаем вывоз мусора
-
+                clean_name = sc.clean_name(name)
+                if (self.db['Работа'].astype(str).str.strip() == clean_name).any():
+                    self._add_work_to_smeta(clean_name, vol, suppress_total_update=True)
+                else: missing.append(clean_name)
+        oh1, oh2 = res['overhead']; l1, l2 = res['lifting']; lt1, lt2 = res.get('lifting_trash', (0.0, 0.0))
         for key, val in (('overhead1', oh1), ('overhead2', oh2), 
-                        ('lift1', l1), ('lift2', l2), 
-                        ('trash1', lt1), ('trash2', lt2)): # Добавляем в цикл
-            self.extra_entries[key].delete(0, tk.END)
-            self.extra_entries[key].insert(0, str(val))
+                         ('lift1', l1), ('lift2', l2), 
+                         ('trash1', lt1), ('trash2', lt2)):
+            self.extra_entries[key].delete(0, tk.END); self.extra_entries[key].insert(0, str(val))
         self.full_rebuild()
         if missing: messagebox.showwarning("Внимание", "Не найдены в справочнике и не были восстановлены работы:\n" + "\n".join(missing))
         messagebox.showinfo("Готово", "Смета загружена.")
@@ -795,8 +813,12 @@ class SmetaApp:
                 new_rows_df = pd.DataFrame(new_rows_list)
                 for nc in numeric_cols:
                     if nc in new_rows_df.columns: new_rows_df[nc] = pd.to_numeric(new_rows_df[nc], errors='coerce').fillna(0.0)
-                self.db = pd.concat([self.db, new_rows_df[sc.COLS]], ignore_index=True)
-                os.makedirs(self.db_folder, exist_ok=True); self.db.to_excel(self.db_file, index=False)
+                if self.db_manager:
+                    self.db_manager.save_legacy_dataframe(new_rows_df)
+                    self.db = self.db_manager.get_legacy_dataframe()
+                else:
+                    self.db = pd.concat([self.db, new_rows_df[sc.COLS]], ignore_index=True)
+                    os.makedirs(self.db_folder, exist_ok=True); self.db.to_excel(self.db_file, index=False)
                 self.refresh_db_table(); self.update_combobox()
                 messagebox.showinfo("Готово", "Новые записи добавлены в справочник.")
         else: messagebox.showinfo("Информация", "Все записи из сметы уже присутствуют в справочнике.")
@@ -818,18 +840,12 @@ class SmetaApp:
                 meta_df = self.db[self.db['Работа'].isin(seen_works) | self.db['Материал'].isin(seen_materials)].drop_duplicates().reset_index(drop=True)
                 if not meta_df.empty: meta_rows = meta_df[sc.COLS].values.tolist()
             title = self.title_entry.get().strip()
-            oh1 = sc.to_float(self.extra_entries['overhead1'].get())
-            oh2 = sc.to_float(self.extra_entries['overhead2'].get())
-            l1 = sc.to_float(self.extra_entries['lift1'].get())
-            l2 = sc.to_float(self.extra_entries['lift2'].get())
-            tr1 = sc.to_float(self.extra_entries['trash1'].get())
-            tr2 = sc.to_float(self.extra_entries['trash2'].get())
-
+            oh1 = sc.to_float(self.extra_entries['overhead1'].get()); oh2 = sc.to_float(self.extra_entries['overhead2'].get())
+            l1 = sc.to_float(self.extra_entries['lift1'].get()); l2 = sc.to_float(self.extra_entries['lift2'].get())
+            tr1 = sc.to_float(self.extra_entries['trash1'].get()); tr2 = sc.to_float(self.extra_entries['trash2'].get())
             sc.export_smeta_to_excel(rows, export_path, title=title, meta_rows=meta_rows, 
-                                    overhead1=oh1, overhead2=oh2, 
-                                    lift1=l1, lift2=l2,
-                                    trash1=tr1, trash2=tr2)            
-  
+                                      overhead1=oh1, overhead2=oh2, lift1=l1, lift2=l2,
+                                      trash1=tr1, trash2=tr2)
             messagebox.showinfo("Excel", f"Смета выгружена успешно!\nФайл: {export_path}")
         except Exception as e: messagebox.showerror("Ошибка", f"Не удалось создать файл.\nЗакройте Excel и попробуйте снова.\n\n{e}")
 
