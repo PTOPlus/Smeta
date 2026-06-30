@@ -142,7 +142,7 @@ class SmetaApp:
         self.refresh_db_list()  # Вызываем после полной инициализации всех виджетов
 
     def show_about(self):
-        messagebox.showinfo("О программе", "Сметчик PRO 5.0\n\nПоддержка двух вариантов цены, учёт доп. расходов, автоматический расчёт экономии.")
+        messagebox.showinfo("О программе", "Сметчик PRO 5.1\n\nПоддержка двух вариантов цены, учёт доп. расходов, автоматический расчёт экономии.")
 
     def open_settings(self):
         settings_win = tk.Toplevel(self.root)
