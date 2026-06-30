@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Сметчик PRO 5.0
+Сметчик PRO 5.1
 Изменения: поддержка двух вариантов цены, сравнение экономии, 
 учёт доп. расходов, корректный импорт/экспорт, фикс ручных правок.
 """
@@ -95,7 +95,7 @@ def add_context_menu(widget):
 class SmetaApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Сметчик PRO 5.0")
+        self.root.title("Сметчик PRO 5.1")
         self.root.geometry("1650x900")
         
         settings = load_settings()

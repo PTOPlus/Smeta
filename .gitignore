@@ -1,0 +1,4 @@
+*.xlsx
+*.parquet
+__pycache__/
+*.json
