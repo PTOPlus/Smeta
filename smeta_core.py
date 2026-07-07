@@ -35,7 +35,7 @@ def to_float(val, default=0.0):
 def is_section(name) -> bool: return str(name).strip().startswith("РАЗДЕЛ:")
 def is_work(name) -> bool: return str(name).strip().startswith("Работа:")
 def is_total(name) -> bool: return str(name).strip().startswith("ИТОГО ПО УЗЛУ")
-def is_material(name) -> bool: return str(name).strip().startswith("    > ") # Унифицировано 4 пробела
+def is_material(name) -> bool: return str(name).strip().startswith(">") # Унифицировано 4 пробела
 
 def clean_name(name) -> str:
     """Убирает служебные префиксы ('Работа:', '    > ') из имени."""

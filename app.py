@@ -279,6 +279,26 @@ class SmetaApp:
             for nf in ('Расход_1', 'Цена_мат_1', 'Цена_раб_1', 'Расход_2', 'Цена_мат_2', 'Цена_раб_2'):
                 raw = self.entries[nf].get().strip()
                 data[nf] = 0.0 if raw == "" else float(raw.replace(',', '.'))
+            # ✅ Автоподстановка В1 по формуле от В2, если В1 не задан вручную
+            # Материалы: Цена_мат_1 = Цена_мат_2 * 1.35
+            auto_filled = []
+            if data['Цена_мат_2'] > 0 and data['Цена_мат_1'] == 0.0:
+                data['Цена_мат_1'] = round(data['Цена_мат_2'] * 1.35, 2)
+                self.entries['Цена_мат_1'].delete(0, tk.END)
+                self.entries['Цена_мат_1'].insert(0, str(data['Цена_мат_1']))
+                auto_filled.append(f"Цена материала В1 = {data['Цена_мат_1']}")
+
+            # Работы: Цена_раб_1 = Цена_раб_2 * 2.2
+            if data['Цена_раб_2'] > 0 and data['Цена_раб_1'] == 0.0:
+                data['Цена_раб_1'] = round(data['Цена_раб_2'] * 2.2, 2)
+                self.entries['Цена_раб_1'].delete(0, tk.END)
+                self.entries['Цена_раб_1'].insert(0, str(data['Цена_раб_1']))
+                auto_filled.append(f"Цена работы В1 = {data['Цена_раб_1']}")
+
+            if auto_filled:
+                messagebox.showinfo("Автоподстановка", 
+                    "Автоматически рассчитаны цены В1:\n" + "\n".join(auto_filled))
+
             work_name = data['Работа']
             
             if self.db_manager is not None:
@@ -750,11 +770,20 @@ class SmetaApp:
 
     def duplicate_material(self):
         sel = self.tree_smeta.selection()
-        if not sel: return messagebox.showwarning("Внимание", "Выберите строку материала.")
-        item = sel[0]; vals = list(self.tree_smeta.item(item, 'values')); name_raw = str(vals[1]).strip()
-        if not name_raw.startswith("    > "): return messagebox.showwarning("Внимание", "Выбрана не строка материала.")
-        children = list(self.tree_smeta.get_children()); insert_idx = children.index(item) + 1
-        self.tree_smeta.insert("", insert_idx, values=tuple(vals)); self.full_rebuild()
+        if not sel:
+            return messagebox.showwarning("Внимание", "Выберите строку материала.")
+        item = sel[0]
+        vals = list(self.tree_smeta.item(item, 'values'))
+        name_raw = str(vals[1]).strip()
+        
+        # ✅ Используем надёжную проверку через функцию is_material
+        if not sc.is_material(name_raw):
+            return messagebox.showwarning("Внимание", "Выбрана не строка материала.")
+
+        children = list(self.tree_smeta.get_children())
+        insert_idx = children.index(item) + 1
+        self.tree_smeta.insert("", insert_idx, values=tuple(vals))
+        self.full_rebuild()
 
     def load_estimate(self):
         file_path = filedialog.askopenfilename(title="Выберите файл сметы", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
