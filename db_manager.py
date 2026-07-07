@@ -108,84 +108,85 @@ class DatabaseManager:
         self.work_materials_dirty = False
     
     def _migrate_from_excel(self):
-        """Мигрирует данные с Excel на нормализованную структуру Parquet."""
+        """Мигрирует данные с Excel на нормализованную структуру Parquet.
+        O(n) — собираем списки словарей, один DataFrame в конце."""
         print(f"Миграция с Excel: {self.legacy_path}")
-        
+
         try:
             df = pd.read_excel(self.legacy_path)
         except Exception as e:
             print(f"Ошибка чтения Excel: {e}")
             self._create_empty_db()
             return
-        
-        # Проверяем формат (ищем ключевые колонки)
+
         required_cols = ['Работа', 'Ед_изм_раб', 'Цена_раб_1', 'Цена_раб_2']
         if not all(col in df.columns for col in required_cols):
             print("Неверный формат Excel, создаем пустую БД")
             self._create_empty_db()
             return
-        
-        # Нормализуем данные
-        works = pd.DataFrame(columns=WORKS_COLS)
-        materials = pd.DataFrame(columns=MATERIALS_COLS)
-        work_materials = pd.DataFrame(columns=WORK_MATERIALS_COLS)
-        
+
+        works_list = []
+        materials_list = []
+        links_list = []
+
         work_id = 1
         mat_id = 1
         work_id_map = {}
         mat_id_map = {}
-        
+
         for _, row in df.iterrows():
             work_name = str(row['Работа']).strip()
-            if not work_name: continue
-            
+            if not work_name:
+                continue
             mat_name = str(row.get('Материал', '-')).strip()
-            
-            # Добавляем работу
+
+            # Работа — добавляем один раз
             if work_name not in work_id_map:
-                works = pd.concat([works, pd.DataFrame([{
+                work_id_map[work_name] = work_id
+                works_list.append({
                     'id': work_id,
                     'name': work_name,
                     'unit': str(row.get('Ед_изм_раб', '')).strip(),
-                    'price_1': float(row.get('Цена_раб_1', 0)) if pd.notna(row.get('Цена_раб_1')) else 0.0,
-                    'price_2': float(row.get('Цена_раб_2', 0)) if pd.notna(row.get('Цена_раб_2')) else 0.0
-                }])], ignore_index=True)
-                work_id_map[work_name] = work_id
+                    'price_1': float(row['Цена_раб_1']) if pd.notna(row.get('Цена_раб_1')) else 0.0,
+                    'price_2': float(row['Цена_раб_2']) if pd.notna(row.get('Цена_раб_2')) else 0.0,
+                })
                 work_id += 1
-            
-            # Добавляем материал и связь
+
+            # Материал + связь
             if mat_name not in ('', '-', '0', 'nan'):
                 if mat_name not in mat_id_map:
-                    materials = pd.concat([materials, pd.DataFrame([{
+                    mat_id_map[mat_name] = mat_id
+                    materials_list.append({
                         'id': mat_id,
                         'name': mat_name,
                         'unit': str(row.get('Ед_изм', '')).strip(),
                         'price_1': float(row.get('Цена_мат_1', 0)) if pd.notna(row.get('Цена_мат_1')) else 0.0,
-                        'price_2': float(row.get('Цена_мат_2', 0)) if pd.notna(row.get('Цена_мат_2')) else 0.0
-                    }])], ignore_index=True)
-                    mat_id_map[mat_name] = mat_id
+                        'price_2': float(row.get('Цена_мат_2', 0)) if pd.notna(row.get('Цена_мат_2')) else 0.0,
+                    })
                     mat_id += 1
-                
-                work_materials = pd.concat([work_materials, pd.DataFrame([{
+
+                links_list.append({
                     'work_id': work_id_map[work_name],
                     'material_id': mat_id_map[mat_name],
                     'consumption_1': float(row.get('Расход_1', 0)) if pd.notna(row.get('Расход_1')) else 0.0,
-                    'consumption_2': float(row.get('Расход_2', 0)) if pd.notna(row.get('Расход_2')) else 0.0
-                }])], ignore_index=True)
-        
-        # Сохраняем в Parquet
-        self.works_cache = works
-        self.materials_cache = materials
-        self.work_materials_cache = work_materials
-        
+                    'consumption_2': float(row.get('Расход_2', 0)) if pd.notna(row.get('Расход_2')) else 0.0,
+                })
+
+        # Один вызов DataFrame на таблицу — O(n)
+        self.works_cache = pd.DataFrame(works_list, columns=WORKS_COLS)
+        self.materials_cache = pd.DataFrame(materials_list, columns=MATERIALS_COLS)
+        self.work_materials_cache = pd.DataFrame(links_list, columns=WORK_MATERIALS_COLS)
+
         self._save_to_parquet()
-        
-        # Резервная копия
+
+        # Резервная копия исходного Excel
         backup_path = self.legacy_path.rsplit('.', 1)[0] + '_backup.xlsx'
         if not os.path.exists(backup_path):
-            df.to_excel(backup_path, index=False)
-        
-        print(f"Миграция завершена. Резервная копия: {backup_path}")
+            try:
+                df.to_excel(backup_path, index=False)
+                print(f"Миграция завершена. Резервная копия: {backup_path}")
+            except Exception as e:
+                print(f"Не удалось создать резервную копию Excel: {e}")
     
     def _create_empty_db(self):
         """Создает пустую нормализованную БД."""
@@ -193,16 +194,44 @@ class DatabaseManager:
         self.materials_cache = pd.DataFrame(columns=MATERIALS_COLS)
         self.work_materials_cache = pd.DataFrame(columns=WORK_MATERIALS_COLS)
         self._save_to_parquet()
+
+    def _atomic_write_parquet(self, table, path: str, backup: bool = True):
+        """Записывает Parquet-таблицу атомарно: tmp → os.replace.
+        Перед перезаписью делает резервную копию .bak (если backup=True)."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + '.tmp'
+
+        # Резервная копия существующего файла
+        if backup and os.path.exists(path):
+            bak_path = path + '.bak'
+            try:
+                if os.path.exists(bak_path):
+                    os.remove(bak_path)
+                os.replace(path, bak_path)  # атомарный rename
+            except OSError:
+                pass  # не критично — продолжаем запись
+
+        # Пишем во временный файл, затем атомарно заменяем целевой
+        pq.write_table(table, tmp_path)
+        os.replace(tmp_path, path)
     
     def _save_to_parquet(self):
-        """Сохраняет кэш в Parquet файлы."""
+        """Сохраняет кэш в Parquet файлы атомарно (tmp + os.replace)."""
         os.makedirs(self.db_folder, exist_ok=True)
-        
-        # Используем PyArrow для сохранения
-        pq.write_table(pa.Table.from_pandas(self.works_cache), self.works_path)
-        pq.write_table(pa.Table.from_pandas(self.materials_cache), self.materials_path)
-        pq.write_table(pa.Table.from_pandas(self.work_materials_cache), self.work_materials_path)
-        
+
+        self._atomic_write_parquet(
+            pa.Table.from_pandas(self.works_cache),
+            self.works_path,
+        )
+        self._atomic_write_parquet(
+            pa.Table.from_pandas(self.materials_cache),
+            self.materials_path,
+        )
+        self._atomic_write_parquet(
+            pa.Table.from_pandas(self.work_materials_cache),
+            self.work_materials_path,
+        )
+
         self.works_dirty = False
         self.materials_dirty = False
         self.work_materials_dirty = False
@@ -343,41 +372,55 @@ class DatabaseManager:
         return pd.DataFrame(result, columns=LEGACY_COLS)
     
     def save_legacy_dataframe(self, df: pd.DataFrame):
-        """Сохраняет данные в старом формате (мигрирует на нормализованную структуру)."""
-        self.works_cache = pd.DataFrame(columns=WORKS_COLS)
-        self.materials_cache = pd.DataFrame(columns=MATERIALS_COLS)
-        self.work_materials_cache = pd.DataFrame(columns=WORK_MATERIALS_COLS)
-        
-        work_id = 1; mat_id = 1
-        work_id_map = {}; mat_id_map = {}
-        
+        """Сохраняет данные в старом формате (мигрирует на нормализованную структуру).
+        O(n) — списки словарей, один DataFrame в конце."""
+        works_list = []
+        materials_list = []
+        links_list = []
+
+        work_id = 1
+        mat_id = 1
+        work_id_map = {}
+        mat_id_map = {}
+
         for _, row in df.iterrows():
             work_name = str(row['Работа']).strip()
             mat_name = str(row['Материал']).strip()
-            
+
             if work_name not in work_id_map:
-                self.works_cache = pd.concat([self.works_cache, pd.DataFrame([{
-                    'id': work_id, 'name': work_name, 'unit': str(row['Ед_изм_раб']).strip(),
+                work_id_map[work_name] = work_id
+                works_list.append({
+                    'id': work_id,
+                    'name': work_name,
+                    'unit': str(row['Ед_изм_раб']).strip(),
                     'price_1': float(row['Цена_раб_1']) if pd.notna(row['Цена_раб_1']) else 0.0,
-                    'price_2': float(row['Цена_раб_2']) if pd.notna(row['Цена_раб_2']) else 0.0
-                }])], ignore_index=True)
-                work_id_map[work_name] = work_id; work_id += 1
-            
+                    'price_2': float(row['Цена_раб_2']) if pd.notna(row['Цена_раб_2']) else 0.0,
+                })
+                work_id += 1
+
             if mat_name not in ('', '-', '0') and mat_name not in mat_id_map:
-                self.materials_cache = pd.concat([self.materials_cache, pd.DataFrame([{
-                    'id': mat_id, 'name': mat_name, 'unit': str(row['Ед_изм']).strip(),
+                mat_id_map[mat_name] = mat_id
+                materials_list.append({
+                    'id': mat_id,
+                    'name': mat_name,
+                    'unit': str(row['Ед_изм']).strip(),
                     'price_1': float(row['Цена_мат_1']) if pd.notna(row['Цена_мат_1']) else 0.0,
-                    'price_2': float(row['Цена_мат_2']) if pd.notna(row['Цена_мат_2']) else 0.0
-                }])], ignore_index=True)
-                mat_id_map[mat_name] = mat_id; mat_id += 1
-            
+                    'price_2': float(row['Цена_мат_2']) if pd.notna(row['Цена_мат_2']) else 0.0,
+                })
+                mat_id += 1
+
             if mat_name not in ('', '-', '0'):
-                self.work_materials_cache = pd.concat([self.work_materials_cache, pd.DataFrame([{
-                    'work_id': work_id_map[work_name], 'material_id': mat_id_map[mat_name],
+                links_list.append({
+                    'work_id': work_id_map[work_name],
+                    'material_id': mat_id_map[mat_name],
                     'consumption_1': float(row['Расход_1']) if pd.notna(row['Расход_1']) else 0.0,
-                    'consumption_2': float(row['Расход_2']) if pd.notna(row['Расход_2']) else 0.0
-                }])], ignore_index=True)
-        
+                    'consumption_2': float(row['Расход_2']) if pd.notna(row['Расход_2']) else 0.0,
+                })
+
+        self.works_cache = pd.DataFrame(works_list, columns=WORKS_COLS)
+        self.materials_cache = pd.DataFrame(materials_list, columns=MATERIALS_COLS)
+        self.work_materials_cache = pd.DataFrame(links_list, columns=WORK_MATERIALS_COLS)
+
         self.works_dirty = True
         self.materials_dirty = True
         self.work_materials_dirty = True

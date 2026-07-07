@@ -28,12 +28,20 @@ SETTINGS_FILE = 'settings.json'
 # --------------------------------------------------------------------------
 def load_settings():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_settings = {'db_folder': script_dir, 'export_folder': script_dir, 'active_db_filename': 'smeta_db'}
+    default_settings = {
+        'db_folder': script_dir,
+        'export_folder': script_dir,
+        'active_db_filename': 'my_works_base.xlsx',
+        # ✅ НОВОЕ: коэффициенты автоподстановки цены В1 от В2
+        'auto_price_mat_ratio': 1.35,   # Цена материала В1 = В2 * 1.35
+        'auto_price_work_ratio': 2.2,   # Цена работы В1 = В2 * 2.2
+    }
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
-            for key in default_settings: settings.setdefault(key, default_settings[key])
+            for key in default_settings:
+                settings.setdefault(key, default_settings[key])
             return settings
         except Exception as e:
             print(f"Ошибка загрузки настроек: {e}")
@@ -99,6 +107,7 @@ class SmetaApp:
         self.root.geometry("1650x900")
         
         settings = load_settings()
+        self.settings = settings
         self.db_folder = settings['db_folder']
         self.export_folder = settings['export_folder']
         self.active_db_filename = settings.get('active_db_filename', 'my_works_base.xlsx')
@@ -146,69 +155,127 @@ class SmetaApp:
 
     def open_settings(self):
         settings_win = tk.Toplevel(self.root)
-        settings_win.title("Настройки"); settings_win.geometry("600x250"); settings_win.resizable(False, False)
-        settings_win.transient(self.root); settings_win.grab_set()
+        settings_win.title("Настройки")
+        settings_win.geometry("600x380")  # ⬆️ увеличена высота
+        settings_win.resizable(False, False)
+        settings_win.transient(self.root)
+        settings_win.grab_set()
+
         db_folder_var = tk.StringVar(value=self.db_folder)
         export_folder_var = tk.StringVar(value=self.export_folder)
-        frame_db = tk.LabelFrame(settings_win, text="Папка для базы данных", padx=10, pady=10); frame_db.pack(fill=tk.X, padx=10, pady=5)
+        
+        # ✅ НОВОЕ: переменные для коэффициентов
+        mat_ratio_var = tk.StringVar(value=str(self.settings.get('auto_price_mat_ratio', 1.35)))
+        work_ratio_var = tk.StringVar(value=str(self.settings.get('auto_price_work_ratio', 2.2)))
+
+        frame_db = tk.LabelFrame(settings_win, text="Папка для базы данных", padx=10, pady=10)
+        frame_db.pack(fill=tk.X, padx=10, pady=5)
         tk.Entry(frame_db, textvariable=db_folder_var, width=60).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_db, text="Обзор...", command=lambda: self.browse_folder(db_folder_var)).pack(side=tk.LEFT)
-        frame_export = tk.LabelFrame(settings_win, text="Папка для сохранения смет", padx=10, pady=10); frame_export.pack(fill=tk.X, padx=10, pady=5)
+
+        frame_export = tk.LabelFrame(settings_win, text="Папка для сохранения смет", padx=10, pady=10)
+        frame_export.pack(fill=tk.X, padx=10, pady=5)
         tk.Entry(frame_export, textvariable=export_folder_var, width=60).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_export, text="Обзор...", command=lambda: self.browse_folder(export_folder_var)).pack(side=tk.LEFT)
-        btn_frame = tk.Frame(settings_win); btn_frame.pack(pady=15)
+
+        # ✅ НОВОЕ: блок коэффициентов
+        frame_ratios = tk.LabelFrame(settings_win, text="Коэффициенты автоподстановки цены В1 от В2", padx=10, pady=10)
+        frame_ratios.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(frame_ratios, text="Материалы (В1 = В2 ×)").grid(row=0, column=0, sticky="w", pady=2)
+        mat_ratio_entry = tk.Entry(frame_ratios, textvariable=mat_ratio_var, width=10)
+        add_clipboard_support(mat_ratio_entry)
+        mat_ratio_entry.grid(row=0, column=1, padx=5, pady=2, sticky="w")
+        tk.Label(frame_ratios, text="(например, 1.35)").grid(row=0, column=2, sticky="w", padx=5)
+        
+        tk.Label(frame_ratios, text="Работы (В1 = В2 ×)").grid(row=1, column=0, sticky="w", pady=2)
+        work_ratio_entry = tk.Entry(frame_ratios, textvariable=work_ratio_var, width=10)
+        add_clipboard_support(work_ratio_entry)
+        work_ratio_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+        tk.Label(frame_ratios, text="(например, 2.2)").grid(row=1, column=2, sticky="w", padx=5)
+
+        btn_frame = tk.Frame(settings_win)
+        btn_frame.pack(pady=15)
         tk.Button(btn_frame, text="Сохранить", bg="#4CAF50", fg="white", width=15,
-                  command=lambda: self.save_settings_and_close(settings_win, db_folder_var.get(), export_folder_var.get())).pack(side=tk.LEFT, padx=10)
+                command=lambda: self.save_settings_and_close(
+                    settings_win, db_folder_var.get(), export_folder_var.get(),
+                    mat_ratio_var.get(), work_ratio_var.get()
+                )).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_frame, text="Отмена", width=15, command=settings_win.destroy).pack(side=tk.LEFT, padx=10)
 
     def browse_folder(self, var):
         folder = filedialog.askdirectory(title="Выберите папку")
         if folder: var.set(folder)
 
-    def save_settings_and_close(self, win, db_folder, export_folder):
-        os.makedirs(db_folder, exist_ok=True); os.makedirs(export_folder, exist_ok=True)
-        self.db_folder = db_folder; self.export_folder = export_folder
+    def save_settings_and_close(self, win, db_folder, export_folder, mat_ratio_str, work_ratio_str):
+        os.makedirs(db_folder, exist_ok=True)
+        os.makedirs(export_folder, exist_ok=True)
+        
+        # ✅ Валидация коэффициентов
+        try:
+            mat_ratio = float(mat_ratio_str.replace(',', '.'))
+            work_ratio = float(work_ratio_str.replace(',', '.'))
+            if mat_ratio <= 0 or work_ratio <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Ошибка", "Коэффициенты должны быть положительными числами.")
+            return
+        
+        self.db_folder = db_folder
+        self.export_folder = export_folder
         self.db_file = os.path.join(self.db_folder, self.active_db_filename)
-        save_settings({'db_folder': db_folder, 'export_folder': export_folder, 'active_db_filename': self.active_db_filename})
-        self.db = self._load_db(); self.refresh_db_table(); self.update_combobox(); self.refresh_db_list()
-        messagebox.showinfo("Готово", "Настройки сохранены."); win.destroy()
+        
+        # ✅ Обновляем настройки в памяти
+        self.settings['auto_price_mat_ratio'] = mat_ratio
+        self.settings['auto_price_work_ratio'] = work_ratio
+        
+        save_settings({
+            'db_folder': db_folder,
+            'export_folder': export_folder,
+            'active_db_filename': self.active_db_filename,
+            'auto_price_mat_ratio': mat_ratio,
+            'auto_price_work_ratio': work_ratio,
+        })
+        
+        self.db = self._load_db()
+        self.refresh_db_table()
+        self.update_combobox()
+        self.refresh_db_list()
+        messagebox.showinfo("Готово", "Настройки сохранены.")
+        win.destroy()
 
     def _load_db(self):
-        # Проверяем Parquet файлы
+        """Загружает базу данных (с поддержкой Parquet и Excel)."""
         if self.db_manager is not None:
+            # Используем нормализованную БД
             return self.db_manager.get_legacy_dataframe()
-        
-        # Проверяем Excel файл
-        if not os.path.exists(self.db_file):
-            # Если нет Excel, но есть Parquet с таким же именем
-            parquet_file = self.db_file.replace('.xlsx', '_works.parquet')
-            if os.path.exists(parquet_file):
-                # Инициализируем db_manager для Parquet
-                db_name = self.active_db_filename.rsplit('.', 1)[0]
-                self.db_manager = DatabaseManager(self.db_folder, db_name)
-                return self.db_manager.get_legacy_dataframe()
-            return pd.DataFrame(columns=sc.COLS)
-        
-        try:
-            raw = pd.read_excel(self.db_file)
-        except Exception as e:
-            messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
-            return pd.DataFrame(columns=sc.COLS)
-        
-        is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS)
-                        and not all(c in raw.columns for c in sc.COLS))
-        migrated = sc.migrate_legacy_df(raw)
-        
-        if is_legacy_only:
+        else:
+            # Старый метод с Excel
+            if not os.path.exists(self.db_file):
+                return pd.DataFrame(columns=sc.COLS)
             try:
-                backup_path = self.db_file.rsplit('.', 1)[0] + "_backup_old_format.xlsx"
-                if not os.path.exists(backup_path):
-                    raw.to_excel(backup_path, index=False)
-                migrated.to_excel(self.db_file, index=False)
-                messagebox.showinfo("База обновлена", f"Формат обновлён. Резерв: {os.path.basename(backup_path)}")
+                raw = pd.read_excel(self.db_file)
             except Exception as e:
-                messagebox.showwarning("Внимание", f"Миграция в памяти успешна, но файл не сохранён:\n{e}")
-        return migrated
+                messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
+                return pd.DataFrame(columns=sc.COLS)
+            
+            is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS)
+                            and not all(c in raw.columns for c in sc.COLS))
+            migrated = sc.migrate_legacy_df(raw)
+            
+            if is_legacy_only:
+                try:
+                    backup_path = self.db_file.rsplit('.', 1)[0] + "_backup_old_format.xlsx"
+                    if not os.path.exists(backup_path):
+                        raw.to_excel(backup_path, index=False)
+                    migrated.to_excel(self.db_file, index=False)
+                    messagebox.showinfo("База обновлена", 
+                        f"Формат обновлён под два варианта цены.\n"
+                        f"Резервная копия: {os.path.basename(backup_path)}")
+                except Exception as e:
+                    messagebox.showwarning("Внимание", 
+                        f"База мигрирована в памяти, но не удалось сохранить файл:\n{e}")
+            return migrated
 
     def setup_db_tab(self):
         db_sel_frame = tk.Frame(self.tab_db); db_sel_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -270,6 +337,7 @@ class SmetaApp:
         self.sort_orders[col] = not self.sort_orders[col]
         self.db = self.db.sort_values(by=col, ascending=self.sort_orders[col]).reset_index(drop=True)
         self.refresh_db_table()
+    
     def save_to_db(self):
         try:
             data = {'Работа': self.work_text.get("1.0", tk.END).strip()}
@@ -280,6 +348,10 @@ class SmetaApp:
                 raw = self.entries[nf].get().strip()
                 data[nf] = 0.0 if raw == "" else float(raw.replace(',', '.'))
             # ✅ Автоподстановка В1 по формуле от В2, если В1 не задан вручную
+            # Коэффициенты берутся из настроек
+            mat_ratio = self.settings.get('auto_price_mat_ratio', 1.35)
+            work_ratio = self.settings.get('auto_price_work_ratio', 2.2)
+            
             # Материалы: Цена_мат_1 = Цена_мат_2 * 1.35
             auto_filled = []
             if data['Цена_мат_2'] > 0 and data['Цена_мат_1'] == 0.0:
@@ -357,22 +429,40 @@ class SmetaApp:
 
     def delete_from_db(self):
         sel = self.tree_db.selection()
-        if not sel: return messagebox.showwarning("Внимание", "Выберите строку для удаления.")
-        if not messagebox.askyesno("Подтверждение", "Удалить выбранную запись из базы?"): return
+        if not sel:
+            return messagebox.showwarning("Внимание", "Выберите строку для удаления.")
+        if not messagebox.askyesno("Подтверждение", "Удалить выбранную запись из базы?"):
+            return
         try:
             idx_to_delete = int(sel[0])
+            if idx_to_delete not in self.db.index:
+                return messagebox.showerror("Ошибка", "Индекс строки не найден в базе.")
+
+            # Получаем имя работы из выбранной строки
+            work_name = str(self.db.loc[idx_to_delete, 'Работа']).strip()
+
             if self.db_manager is not None:
-                work_id = self.db.iloc[idx_to_delete]['id'] if 'id' in self.db.columns else None
-                if work_id: self.db_manager.delete_work(work_id)
+                # ✅ Удаляем через нормализованную БД по имени работы
+                work = self.db_manager.get_work_by_name(work_name)
+                if work is None:
+                    return messagebox.showerror("Ошибка", f"Работа «{work_name}» не найдена в базе.")
+                work_id = work['id']
+                self.db_manager.delete_work(work_id)
                 self.db_manager.flush()
+                # Перезагружаем legacy-представление из БД
                 self.db = self.db_manager.get_legacy_dataframe()
             else:
-                if idx_to_delete in self.db.index:
-                    self.db = self.db.drop(index=idx_to_delete).reset_index(drop=True)
-                    os.makedirs(self.db_folder, exist_ok=True); self.db.to_excel(self.db_file, index=False)
-            self.refresh_db_table(); self.update_combobox()
-            messagebox.showinfo("Готово", "Запись удалена.")
-        except Exception as e: messagebox.showerror("Ошибка", f"Не удалось удалить запись:\n{e}")
+                # Старый метод через Excel — удаляем ВСЕ строки с этим именем работы
+                mask = self.db['Работа'].astype(str).str.strip() == work_name
+                self.db = self.db[~mask].reset_index(drop=True)
+                os.makedirs(self.db_folder, exist_ok=True)
+                self.db.to_excel(self.db_file, index=False)
+
+            self.refresh_db_table()
+            self.update_combobox()
+            messagebox.showinfo("Готово", f"Запись «{work_name}» удалена.")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось удалить запись:\n{e}")
 
     def refresh_db_table(self):
         if not hasattr(self, 'tree_db'):
@@ -415,35 +505,51 @@ class SmetaApp:
         if not os.path.exists(self.db_folder):
             os.makedirs(self.db_folder, exist_ok=True)
         
-        # Ищем и Excel, и Parquet файлы
-        files = sorted([
-            f for f in os.listdir(self.db_folder) 
-            if f.lower().endswith(('.xlsx', '.parquet'))
-        ])
+        files = os.listdir(self.db_folder)
         
-        # Убираем дубликаты (если есть и xlsx, и parquet с одинаковым именем)
-        unique_files = []
-        seen_names = set()
+        # Собираем Excel файлы
+        db_files = [f for f in files if f.lower().endswith('.xlsx')]
+        
+        # Собираем Parquet базы (группы из 3 файлов)
+        parquet_bases = set()
         for f in files:
-            name = f.rsplit('.', 1)[0]  # Убираем расширение
-            if name not in seen_names:
-                unique_files.append(f)
-                seen_names.add(name)
+            if f.lower().endswith('_works.parquet'):
+                base_name = f[:-len('_works.parquet')]
+                # Проверяем, что все три файла существуют
+                if (os.path.exists(os.path.join(self.db_folder, f'{base_name}_works.parquet')) and
+                    os.path.exists(os.path.join(self.db_folder, f'{base_name}_materials.parquet')) and
+                    os.path.exists(os.path.join(self.db_folder, f'{base_name}_work_materials.parquet'))):
+                    parquet_bases.add(f'{base_name}.parquet')  # Добавляем .parquet для единообразия
         
-        # Очищаем список перед заполнением
-        self.db_combo['values'] = unique_files
+        # Добавляем Parquet базы в список
+        db_files.extend(sorted(parquet_bases))
+        db_files = sorted(db_files)
         
-        if self.active_db_filename in unique_files:
+        self.db_combo['values'] = db_files
+        
+        if self.active_db_filename in db_files:
             self.db_combo.set(self.active_db_filename)
-        elif unique_files:
-            self.db_combo.set(unique_files[0])
+        elif db_files:
+            self.db_combo.set(db_files[0])
             self.on_db_selected()
 
     def on_db_selected(self, event=None):
         new_db = self.db_combo.get()
         if new_db and new_db != self.active_db_filename:
             self.active_db_filename = new_db
-            self.db_file = os.path.join(self.db_folder, new_db)
+            
+            # Для Parquet баз извлекаем имя без .parquet
+            if new_db.endswith('.parquet'):
+                db_name = new_db[:-len('.parquet')]
+                if HAS_DB_MANAGER:
+                    self.db_manager = DatabaseManager(self.db_folder, db_name)
+                self.db_file = os.path.join(self.db_folder, f'{db_name}_works.parquet')
+            else:
+                # Excel база
+                if HAS_DB_MANAGER:
+                    self.db_manager = None
+                self.db_file = os.path.join(self.db_folder, new_db)
+            
             self._save_active_db_to_settings()
             self.db = self._load_db()
             self.refresh_db_table()
