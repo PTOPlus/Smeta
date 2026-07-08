@@ -1,6 +1,6 @@
 *.xlsx
 *.parquet
 __pycache__/
-*.json
+settings.json
 *.bak
 KODA.md
