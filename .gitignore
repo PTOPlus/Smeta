@@ -1,0 +1,6 @@
+*.xlsx
+*.parquet
+__pycache__/
+*.json
+*.bak
+KODA.md
