@@ -187,7 +187,9 @@ class SmetaApp:
         self.sort_orders = {col: False for col in sc.COLS}
         self.display_cols = ['Работа', 'Ед_изм_раб', 'Цена_раб_1', 'Цена_раб_2',
                              'Материал', 'Ед_изм', 'Расход_1', 'Цена_мат_1', 'Расход_2', 'Цена_мат_2']
+        self.work_units = {}  # mapping: название работы -> ед.изм.
 
+        # Меню приложения
         menubar = tk.Menu(root)
         root.config(menu=menubar)
         settings_menu = tk.Menu(menubar, tearoff=0)
@@ -443,11 +445,11 @@ class SmetaApp:
 
         db_tree_frame = tk.Frame(self.tab_db)
         db_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.tree_db = ttk.Treeview(db_tree_frame, columns=self.display_cols, show='headings')
+        self.tree_db = ttk.Treeview(db_tree_frame, columns=self.display_cols, show='headings', style='Treeview')
         for c in self.display_cols:
             self.tree_db.heading(c, text=c, command=lambda _col=c: self.sort_column(_col))
             width = 250 if c == "Работа" else 100 if "Цена" in c else 80
-            self.tree_db.column(c, width=width)
+            self.tree_db.column(c, width=width, minwidth=width)
         db_yscroll = ttk.Scrollbar(db_tree_frame, orient="vertical", command=self.tree_db.yview)
         self.tree_db.configure(yscrollcommand=db_yscroll.set)
         self.tree_db.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -685,22 +687,44 @@ class SmetaApp:
         if not hasattr(self, 'work_combo'):
             return
         if not self.db.empty:
-            self.all_works_list = sorted(list(self.db['Работа'].astype(str).unique()))
+            # Создаём словарь: название -> ед.изм
+            self.work_units = {}
+            for work_name in self.db['Работа'].astype(str).unique():
+                work_name = str(work_name).strip()
+                if work_name:
+                    unit = str(self.db[self.db['Работа'].astype(str).str.strip() == work_name]['Ед_изм_раб'].iloc[0]).strip()
+                    self.work_units[work_name] = unit
+            # Формируем список отображаемых значений
+            display_list = sorted([f"{name} ({unit})" for name, unit in self.work_units.items()])
+            self.all_works_list = display_list
             self.work_combo['values'] = self.all_works_list
         else:
             self.all_works_list = []
             self.work_combo['values'] = []
+            self.work_units = {}
+
+    def _extract_work_name(self, display_text):
+        """Извлекает чистое название работы из строки 'Название (ед.изм.)'."""
+        if not display_text:
+            return display_text
+        # Ищем последнее ' (' и извлекаем часть до него
+        idx = display_text.rfind(' (')
+        if idx >= 0:
+            return display_text[:idx].strip()
+        return display_text.strip()
 
     def filter_works_combo(self, event=None):
         typed = self.work_combo.get().strip()
-        if not hasattr(self, 'all_works_list'):
+        if not hasattr(self, 'work_units'):
             return
         if not typed:
             self.work_combo['values'] = self.all_works_list
             return
         lower_typed = typed.lower()
-        filtered = [w for w in self.all_works_list if lower_typed in w.lower()]
-        self.work_combo['values'] = filtered
+        # Фильтруем по названию работы (без единицы измерения)
+        filtered_names = [name for name in self.work_units if lower_typed in name.lower()]
+        self.all_works_list = sorted([f"{name} ({self.work_units[name]})" for name in filtered_names])
+        self.work_combo['values'] = self.all_works_list
         self.work_combo.icursor(tk.END)
 
     def refresh_db_list(self):
@@ -847,7 +871,9 @@ class SmetaApp:
             selectmode='extended',
             style="Smeta.Treeview"
         )
+        
         widths = {"№": 45, "Наименование": 380, "Ед. изм.": 65}
+        
         for c in self.calc_cols:
             self.tree_smeta.heading(c, text=c)
             self.tree_smeta.column(c, width=widths.get(c, 90),
@@ -941,9 +967,11 @@ class SmetaApp:
             self._start_cell_edit(item, vals, col_idx)
 
     def add_to_estimate(self):
-        work_name = self.work_combo.get().strip()
-        if not work_name:
+        display_text = self.work_combo.get().strip()
+        if not display_text:
             return messagebox.showwarning("Внимание", "Выберите работу из списка.")
+        # Извлекаем чистое название работы
+        work_name = self._extract_work_name(display_text)
         raw = self.vol_entry.get().strip()
         try:
             vol = float(raw.replace(',', '.'))
@@ -1369,18 +1397,33 @@ class SmetaApp:
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             export_path = os.path.join(self.export_folder, f"Smeta_{timestamp}.xlsx")
             os.makedirs(self.export_folder, exist_ok=True)
-            seen_works, seen_materials = set(), set()
+            
+            # ✅ Формируем meta_rows из данных сметы (работы + материалы)
+            meta_rows = []
+            seen = set()
+            current_work = None
+            
             for vals in rows:
                 name = str(vals[1]).strip()
                 if sc.is_work(name):
-                    seen_works.add(sc.clean_name(name))
-                elif sc.is_material(name):
-                    seen_materials.add(sc.clean_name(name))
-            meta_rows = []
-            if seen_works or seen_materials:
-                meta_df = self.db[self.db['Работа'].isin(seen_works) | self.db['Материал'].isin(seen_materials)].drop_duplicates().reset_index(drop=True)
-                if not meta_df.empty:
-                    meta_rows = meta_df[sc.COLS].values.tolist()
+                    current_work = sc.clean_name(name)
+                elif sc.is_material(name) and current_work:
+                    clean_mat = sc.clean_name(name)
+                    key = (current_work, clean_mat)
+                    if key not in seen:
+                        seen.add(key)
+                        meta_rows.append([
+                            current_work,
+                            "",  # Ед_изм_раб
+                            clean_mat,
+                            str(vals[2]),  # Ед_изм
+                            vals[3],  # Расход_1
+                            vals[5],  # Цена_мат_1
+                            "",  # Цена_раб_1
+                            vals[7],  # Расход_2
+                            vals[9],  # Цена_мат_2
+                            ""   # Цена_раб_2
+                        ])
             title = self.title_entry.get().strip()
             oh1 = sc.to_float(self.extra_entries['overhead1'].get())
             oh2 = sc.to_float(self.extra_entries['overhead2'].get())

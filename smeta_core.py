@@ -469,7 +469,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
 
             j = i + 1
             mats = []
-            while j < n and str(rows[j][1]).strip().startswith("    > "):
+            while j < n and str(rows[j][1]).strip().startswith(">"):
                 mats.append(rows[j])
                 j += 1
 
@@ -484,11 +484,11 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
             ws.write(row_top, 2, unit_w, f_item_ctr)
             ws.write_blank(row_top, 3, None, f_item_txt)
             ws.write(row_top, 4, vol, f_item_num)
-            ws.write_blank(row_top, 5, None, f_item_num)
+            ws.write(row_top, 5, price_w1, f_item_num)
             ws.write_formula(row_top, 6, f"={RC(row_workonly, 6)}+{RC(row_matonly, 6)}", f_item_num)
             ws.write_blank(row_top, 7, None, f_item_txt)
             ws.write(row_top, 8, vol, f_item_num)
-            ws.write_blank(row_top, 9, None, f_item_num)
+            ws.write(row_top, 9, price_w2, f_item_num)
             ws.write_formula(row_top, 10, f"={RC(row_workonly, 10)}+{RC(row_matonly, 10)}", f_item_num)
 
             ws.write_blank(row_workonly, 0, None, f_blank)
@@ -520,7 +520,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
 
             for k, mvals in enumerate(mats):
                 r = row_mat_start + k
-                mat_name = str(mvals[1]).replace("    > ", "").strip()
+                mat_name = clean_name(str(mvals[1]))
                 unit_m = str(mvals[2])
                 norm1 = to_float(mvals[3])
                 norm2 = to_float(mvals[7])
