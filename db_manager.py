@@ -390,58 +390,55 @@ class DatabaseManager:
         return pd.DataFrame(result, columns=LEGACY_COLS)
     
     def save_legacy_dataframe(self, df: pd.DataFrame):
-        """Сохраняет данные в старом формате (мигрирует на нормализованную структуру).
-        O(n) — списки словарей, один DataFrame в конце."""
-        works_list = []
-        materials_list = []
-        links_list = []
+        """Добавляет/обновляет записи (в старом плоском формате) в нормализованной БД.
 
-        work_id = 1
-        mat_id = 1
-        work_id_map = {}
-        mat_id_map = {}
-
+        КРИТИЧЕСКИЙ ФИКС: этот метод раньше ПОЛНОСТЬЮ ЗАТИРАЛ works_cache/
+        materials_cache/work_materials_cache, перестраивая их заново только из
+        строк переданного df. Единственный вызывающий код — app.py._reconcile_meta —
+        передаёт сюда DataFrame ТОЛЬКО с новыми/изменёнными записями, найденными
+        в конкретной открытой смете. То есть при каждом импорте старой сметы и
+        подтверждении "Добавить в справочник" вся остальная база (все работы и
+        материалы, не встретившиеся именно в этой смете) бесследно удалялась —
+        подтверждено тестом: база из 2 работ после импорта 1 новой записи
+        схлопывалась до 1 работы, при этом пользователю показывалось сообщение
+        "Новые записи добавлены в справочник".
+        Теперь метод действительно ДОБАВЛЯЕТ/ОБНОВЛЯЕТ: ищет существующую
+        работу/материал по имени и обновляет её, либо создаёт новую — не
+        затрагивая остальные записи базы.
+        """
         for _, row in df.iterrows():
             work_name = str(row['Работа']).strip()
+            if not work_name:
+                continue
             mat_name = str(row['Материал']).strip()
 
-            if work_name not in work_id_map:
-                work_id_map[work_name] = work_id
-                works_list.append({
-                    'id': work_id,
-                    'name': work_name,
-                    'unit': str(row['Ед_изм_раб']).strip(),
-                    'price_1': float(row['Цена_раб_1']) if pd.notna(row['Цена_раб_1']) else 0.0,
-                    'price_2': float(row['Цена_раб_2']) if pd.notna(row['Цена_раб_2']) else 0.0,
-                })
-                work_id += 1
+            unit_w = str(row['Ед_изм_раб']).strip()
+            price_w1 = float(row['Цена_раб_1']) if pd.notna(row['Цена_раб_1']) else 0.0
+            price_w2 = float(row['Цена_раб_2']) if pd.notna(row['Цена_раб_2']) else 0.0
 
-            if mat_name not in ('', '-', '0') and mat_name not in mat_id_map:
-                mat_id_map[mat_name] = mat_id
-                materials_list.append({
-                    'id': mat_id,
-                    'name': mat_name,
-                    'unit': str(row['Ед_изм']).strip(),
-                    'price_1': float(row['Цена_мат_1']) if pd.notna(row['Цена_мат_1']) else 0.0,
-                    'price_2': float(row['Цена_мат_2']) if pd.notna(row['Цена_мат_2']) else 0.0,
-                })
-                mat_id += 1
+            work = self.get_work_by_name(work_name)
+            if work is None:
+                work_id = self.add_work(work_name, unit_w, price_w1, price_w2)
+            else:
+                work_id = int(work['id'])
+                self.update_work(work_id, unit=unit_w, price_1=price_w1, price_2=price_w2)
 
-            if mat_name not in ('', '-', '0'):
-                links_list.append({
-                    'work_id': work_id_map[work_name],
-                    'material_id': mat_id_map[mat_name],
-                    'consumption_1': float(row['Расход_1']) if pd.notna(row['Расход_1']) else 0.0,
-                    'consumption_2': float(row['Расход_2']) if pd.notna(row['Расход_2']) else 0.0,
-                })
+            if mat_name not in ('', '-', '0', 'nan'):
+                unit_m = str(row['Ед_изм']).strip()
+                price_m1 = float(row['Цена_мат_1']) if pd.notna(row['Цена_мат_1']) else 0.0
+                price_m2 = float(row['Цена_мат_2']) if pd.notna(row['Цена_мат_2']) else 0.0
 
-        self.works_cache = pd.DataFrame(works_list, columns=WORKS_COLS)
-        self.materials_cache = pd.DataFrame(materials_list, columns=MATERIALS_COLS)
-        self.work_materials_cache = pd.DataFrame(links_list, columns=WORK_MATERIALS_COLS)
+                mat = self.get_material_by_name(mat_name)
+                if mat is None:
+                    mat_id = self.add_material(mat_name, unit_m, price_m1, price_m2)
+                else:
+                    mat_id = int(mat['id'])
+                    self.update_material(mat_id, unit=unit_m, price_1=price_m1, price_2=price_m2)
 
-        self.works_dirty = True
-        self.materials_dirty = True
-        self.work_materials_dirty = True
+                cons1 = float(row['Расход_1']) if pd.notna(row['Расход_1']) else 0.0
+                cons2 = float(row['Расход_2']) if pd.notna(row['Расход_2']) else 0.0
+                self.add_work_material_link(work_id, mat_id, cons1, cons2)
+
         self._save_to_parquet()
     
     # --- Поиск и фильтрация ---

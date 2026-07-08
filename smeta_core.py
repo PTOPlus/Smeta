@@ -227,15 +227,19 @@ def rebuild_smeta(rows):
             continue
 
         if is_material(name):
+            # Объём материала — всегда производная величина (Норма × Объём работы).
+            # Колонки "Объём" (индексы 4 и 8) НЕ входят в список редактируемых
+            # для строки материала (см. _editable_cols_for в app.py — там только
+            # {1, 3, 5, 7, 9}), то есть пользователь никогда не вводит их вручную.
+            # Старый код вместо этого проверял "если текущее значение > 0 — не
+            # трогать", из-за чего при изменении Объёма РАБОТЫ материалы не
+            # пересчитывались и оставались с прежним (уже устаревшим) объёмом.
+            # Проверено тестом: Работа 10->50, Материал с нормой 2 должен дать
+            # 100, а не оставаться на 20.
             norm1 = to_float(vals[3])
             norm2 = to_float(vals[7])
-            calc_qty1 = round(norm1 * work_vol, 3)
-            calc_qty2 = round(norm2 * work_vol, 3)
-            
-            cur_qty1 = to_float(vals[4], 0.0)
-            cur_qty2 = to_float(vals[8], 0.0)
-            vals[4] = cur_qty1 if cur_qty1 > 0 else calc_qty1
-            vals[8] = cur_qty2 if cur_qty2 > 0 else calc_qty2
+            vals[4] = round(norm1 * work_vol, 3)
+            vals[8] = round(norm2 * work_vol, 3)
 
             price1 = to_float(vals[5])
             price2 = to_float(vals[9])

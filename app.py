@@ -797,13 +797,22 @@ class SmetaApp:
             db_name = new_name.replace('.xlsx', '')
             self.active_db_filename = db_name
             self.db_manager = DatabaseManager(self.db_folder, db_name)
+            # ВАЖНО: refresh_db_list()/on_db_selected() распознают Parquet-базы
+            # по синтетическому имени "{db_name}.parquet" (см. refresh_db_list).
+            # Раньше здесь combo выставлялся в "{db_name}.xlsx" — on_db_selected
+            # видел расширение .xlsx, считал это Excel-базой, обнулял только что
+            # созданный self.db_manager и подставлял пустой DataFrame. Внешне это
+            # выглядело так, будто созданная база сразу же "пустая" — до тех пор,
+            # пока пользователь вручную не выбирал её в выпадающем списке.
+            display_name = f'{db_name}.parquet'
         else:
             pd.DataFrame(columns=sc.COLS).to_excel(new_path, index=False)
+            display_name = new_name
         
         self.refresh_db_list()
-        self.db_combo.set(new_name)
+        self.db_combo.set(display_name)
         self.on_db_selected()
-        messagebox.showinfo("Готово", f"База «{new_name}» создана и загружена.")
+        messagebox.showinfo("Готово", f"База «{display_name}» создана и загружена.")
 
     def delete_current_db(self):
         if not self.active_db_filename:
