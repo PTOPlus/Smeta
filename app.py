@@ -947,7 +947,7 @@ class SmetaApp:
         self.update_total_sum()
 
     def add_section(self):
-        self.tree_smeta.insert("", tk.END, values=("", "РАЗДЕЛ: Новый раздел", "", "", "", "", "", "", "", "", ""), tags=("section",))
+        self.tree_smeta.insert("", tk.END, values=("", f"{sc.SECTION_PREFIX}Новый раздел", "", "", "", "", "", "", "", "", ""), tags=("section",))
 
     def _editable_cols_for(self, name_raw):
         name_raw = str(name_raw).strip()
@@ -1046,7 +1046,7 @@ class SmetaApp:
         self.edit_entry.place(x=root_x + x, y=root_y + y, width=w, height=h)
         add_clipboard_support(self.edit_entry)
         add_context_menu(self.edit_entry)
-        self.edit_entry.insert(0, vals[1].replace("РАЗДЕЛ: ", ""))
+        self.edit_entry.insert(0, vals[1].replace(sc.SECTION_PREFIX, ""))
         self.edit_entry.focus()
         self.edit_entry.select_range(0, tk.END)
         self.edit_item, self.edit_orig, self.edit_col_idx = item, list(vals), 1
@@ -1060,7 +1060,7 @@ class SmetaApp:
         nm = self.edit_entry.get().strip()
         if nm:
             nv = self.edit_orig[:]
-            nv[1] = f"РАЗДЕЛ: {nm}"
+            nv[1] = f"{sc.SECTION_PREFIX}{nm}"
             self.tree_smeta.item(self.edit_item, values=tuple(nv))
         self._destroy_edit()
 
@@ -1104,11 +1104,11 @@ class SmetaApp:
             nvals[self.edit_col_idx] = nv
         if self.edit_col_idx == 1:
             orig = str(self.edit_orig[1]).strip()
-            clean = str(nvals[1]).replace("Работа: ", "").replace("    > ", "").strip()
-            if orig.startswith("    > "):
-                nvals[1] = f"    > {clean}"
-            elif orig.startswith("Работа: "):
-                nvals[1] = f"Работа: {clean}"
+            clean = str(nvals[1]).replace(sc.WORK_PREFIX, "").replace(sc.MATERIAL_PREFIX, "").strip()
+            if orig.startswith(sc.MATERIAL_PREFIX):
+                nvals[1] = f"{sc.MATERIAL_PREFIX}{clean}"
+            elif orig.startswith(sc.WORK_PREFIX):
+                nvals[1] = f"{sc.WORK_PREFIX}{clean}"
         self.tree_smeta.item(self.edit_item, values=tuple(nvals))
         self._sync_db(nvals, self.edit_col_idx)
         self._propagate_same_name(nvals, self.edit_col_idx)
@@ -1123,8 +1123,8 @@ class SmetaApp:
         if col_idx not in (3, 5, 7, 9):
             return
         orig_name = str(self.edit_orig[1]).strip()
-        is_work_row = orig_name.startswith("Работа: ")
-        is_mat_row = orig_name.startswith("    > ")
+        is_work_row = orig_name.startswith(sc.WORK_PREFIX)
+        is_mat_row = orig_name.startswith(sc.MATERIAL_PREFIX)
         if not (is_work_row or is_mat_row):
             return
         clean = sc.clean_name(orig_name)
@@ -1134,7 +1134,7 @@ class SmetaApp:
                 continue
             vals = list(self.tree_smeta.item(item, 'values'))
             v_name = str(vals[1]).strip()
-            same_type = ((is_work_row and v_name.startswith("Работа: ")) or (is_mat_row and v_name.startswith("    > ")))
+            same_type = ((is_work_row and v_name.startswith(sc.WORK_PREFIX)) or (is_mat_row and v_name.startswith(sc.MATERIAL_PREFIX)))
             if not same_type:
                 continue
             if sc.clean_name(v_name) == clean:
@@ -1143,8 +1143,8 @@ class SmetaApp:
 
     def _sync_db(self, nv, col_idx):
         ov = str(self.edit_orig[1]).strip()
-        is_work_row = ov.startswith("Работа: ")
-        is_mat_row = ov.startswith("    > ")
+        is_work_row = ov.startswith(sc.WORK_PREFIX)
+        is_mat_row = ov.startswith(sc.MATERIAL_PREFIX)
         clean = sc.clean_name(ov)
         col_map_mat = {3: 'consumption_1', 5: 'price_1', 7: 'consumption_2', 9: 'price_2'}
         col_map_work = {5: 'price_1', 9: 'price_2'}
@@ -1152,7 +1152,7 @@ class SmetaApp:
             if self.db_manager is None:
                 return
             if col_idx == 1:
-                nc = str(nv[1]).replace("Работа: ", "").replace("    > ", "").strip()
+                nc = str(nv[1]).replace(sc.WORK_PREFIX, "").replace(sc.MATERIAL_PREFIX, "").strip()
                 if is_work_row:
                     self.db_manager.works_cache.loc[self.db_manager.works_cache['name'].str.strip() == clean, 'name'] = nc
                 elif is_mat_row:
@@ -1288,7 +1288,7 @@ class SmetaApp:
         data = self._open_material_dialog()
         if not data or not data.get('name'):
             return
-        self.tree_smeta.insert("", insert_idx, values=("", f"    > {data['name']}", data['unit'], data['norm1'], "", data['price1'], "", data['norm2'], "", data['price2'], ""))
+        self.tree_smeta.insert("", insert_idx, values=("", f"{sc.MATERIAL_PREFIX}{data['name']}", data['unit'], data['norm1'], "", data['price1'], "", data['norm2'], "", data['price2'], ""))
         self.full_rebuild()
 
     def duplicate_material(self):
@@ -1332,7 +1332,7 @@ class SmetaApp:
         missing = []
         for entry in res['sequence']:
             if entry[0] == 'section':
-                self.tree_smeta.insert("", tk.END, values=("", f"РАЗДЕЛ: {entry[1]}", "", "", "", "", "", "", "", "", ""), tags=("section",))
+                self.tree_smeta.insert("", tk.END, values=("", f"{sc.SECTION_PREFIX}{entry[1]}", "", "", "", "", "", "", "", "", ""), tags=("section",))
             else:
                 _, name, vol = entry
                 clean_name = sc.clean_name(name)

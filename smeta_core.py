@@ -17,6 +17,13 @@ CALC_HEADERS = ("№", "Наименование", "Ед. изм.",
                 "Норма В2", "Объём В2", "Цена В2", "Стоимость В2")
 EMPTY_TOKENS = ("", "-", "0", "nan", "none", "NaN")
 
+# Префиксы для маркировки типов строк в смете
+WORK_PREFIX = "Работа: "
+MATERIAL_PREFIX = "    > "  # 4 пробела + ">"
+TOTAL_PREFIX = "ИТОГО ПО УЗЛУ: "
+SECTION_PREFIX = "РАЗДЕЛ: "
+
+
 # --------------------------------------------------------------------------
 # Базовые помощники
 # --------------------------------------------------------------------------
@@ -38,13 +45,13 @@ def to_float(val, default=0.0):
         return default
 
 def is_section(name) -> bool:
-    return str(name).strip().startswith("РАЗДЕЛ:")
+    return str(name).strip().startswith(SECTION_PREFIX)
 
 def is_work(name) -> bool:
     return str(name).strip().startswith("Работа:")
 
 def is_total(name) -> bool:
-    return str(name).strip().startswith("ИТОГО ПО УЗЛУ")
+    return str(name).strip().startswith(TOTAL_PREFIX)
 
 def is_material(name) -> bool:
     return str(name).strip().startswith(">")
@@ -52,8 +59,8 @@ def is_material(name) -> bool:
 def clean_name(name) -> str:
     """Убирает служебные префиксы ('Работа:', '>', пробелы) из имени."""
     s = str(name).strip()
-    if s.startswith("Работа: "):
-        s = s[len("Работа: "):]
+    if s.startswith(WORK_PREFIX):
+        s = s[len(WORK_PREFIX):]
     elif s.startswith(">"):
         s = s[1:]
     return s.strip()
@@ -106,7 +113,7 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
         work_cost1 = round(vol * price_w1, 2)
         work_cost2 = round(vol * price_w2, 2)
         
-        rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
+        rows = [(next_num, f"{WORK_PREFIX}{work_name}", unit_w, "-", vol, price_w1, work_cost1,
                  "-", vol, price_w2, work_cost2)]
         
         mat_total1 = 0.0
@@ -129,13 +136,13 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
             mat_total1 += cost1
             mat_total2 += cost2
             
-            rows.append(("", f"    > {mat_name}", str(mat['unit']), 
+            rows.append(("", f"{MATERIAL_PREFIX}{mat_name}", str(mat['unit']), 
                         rashod1, qty1, price_m1, cost1,
                         rashod2, qty2, price_m2, cost2))
         
         combined1 = round(work_cost1 + mat_total1, 2)
         combined2 = round(work_cost2 + mat_total2, 2)
-        rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
+        rows.append(("", f"{TOTAL_PREFIX}{work_name}", "", "", "", "Сумма:", combined1,
                      "", "", "Сумма:", combined2))
         return rows
     else:
@@ -152,7 +159,7 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
         work_cost1 = round(vol * price_w1, 2)
         work_cost2 = round(vol * price_w2, 2)
         
-        rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
+        rows = [(next_num, f"{WORK_PREFIX}{work_name}", unit_w, "-", vol, price_w1, work_cost1,
                  "-", vol, price_w2, work_cost2)]
         
         mat_total1 = 0.0
@@ -171,12 +178,12 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
             cost2 = round(qty2 * price_m2, 2)
             mat_total1 += cost1
             mat_total2 += cost2
-            rows.append(("", f"    > {mat_name}", str(r['Ед_изм']), rashod1, qty1, price_m1, cost1,
+            rows.append(("", f"{MATERIAL_PREFIX}{mat_name}", str(r['Ед_изм']), rashod1, qty1, price_m1, cost1,
                          rashod2, qty2, price_m2, cost2))
         
         combined1 = round(work_cost1 + mat_total1, 2)
         combined2 = round(work_cost2 + mat_total2, 2)
-        rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
+        rows.append(("", f"{TOTAL_PREFIX}{work_name}", "", "", "", "Сумма:", combined1,
                      "", "", "Сумма:", combined2))
         return rows
 
@@ -193,7 +200,7 @@ def rebuild_smeta(rows):
     def flush_node():
         nonlocal node_work_name, node_work_cost1, node_work_cost2, node_mat_cost1, node_mat_cost2
         if node_work_name is not None:
-            out.append(("", f"ИТОГО ПО УЗЛУ: {node_work_name}", "", "", "", "Сумма:",
+            out.append(("", f"{TOTAL_PREFIX}{node_work_name}", "", "", "", "Сумма:",
                         round(node_work_cost1 + node_mat_cost1, 2),
                         "", "", "Сумма:", round(node_work_cost2 + node_mat_cost2, 2)))
         node_work_name = None
@@ -221,7 +228,7 @@ def rebuild_smeta(rows):
             vals[8] = work_vol
             vals[6] = round(work_vol * price1, 2)
             vals[10] = round(work_vol * price2, 2)
-            node_work_name = name.replace("Работа: ", "").strip()
+            node_work_name = name.replace(WORK_PREFIX, "").strip()
             node_work_cost1, node_work_cost2 = vals[6], vals[10]
             out.append(tuple(vals))
             continue
@@ -311,9 +318,9 @@ def parse_exported_sheet(sheet_values):
         if str0.isdigit() and str1.isdigit() and int(str0) < 10 and int(str1) < 10:
             continue
             
-        if str1.startswith("РАЗДЕЛ:") or (str0 and not str0.replace('.', '').isdigit() and not str1):
+        if str1.startswith(SECTION_PREFIX.rstrip()) or (str0 and not str0.replace('.', '').isdigit() and not str1):
             if str0 and len(str0) > 5 and not str0.replace('.', '').isdigit():
-                sequence.append(('section', str0.replace("РАЗДЕЛ:", "").strip()))
+                sequence.append(('section', str0.replace(SECTION_PREFIX, "").strip()))
                 continue
         
         if not str1 and str0 and not str0.replace('.', '').isdigit() and len(str0) > 3:
@@ -453,15 +460,15 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         vals = rows[i]
         name = str(vals[1]).strip()
 
-        if name.startswith("РАЗДЕЛ: "):
-            section_title = name.replace("РАЗДЕЛ: ", "").strip()
+        if name.startswith(SECTION_PREFIX):
+            section_title = name.replace(SECTION_PREFIX, "").strip()
             ws.merge_range(excel_row, 0, excel_row, 10, section_title, f_section)
             excel_row += 1
             i += 1
             continue
 
-        if name.startswith("Работа: "):
-            work_name = name.replace("Работа: ", "").strip()
+        if name.startswith(WORK_PREFIX):
+            work_name = name.replace(WORK_PREFIX, "").strip()
             unit_w = str(vals[2])
             try:
                 work_num = int(vals[0])
