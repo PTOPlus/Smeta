@@ -350,24 +350,42 @@ class DatabaseManager:
         self.work_materials_cache = self.work_materials_cache[~mask]
         self.work_materials_dirty = True
     
+    def delete_work_material_links_by_work(self, work_id: int):
+        """Удаляет ВСЕ связи материалов для указанной работы."""
+        self.work_materials_cache = self.work_materials_cache[self.work_materials_cache['work_id'] != work_id]
+        self.work_materials_dirty = True
+    
     # --- Методы для обратной совместимости ---
     
     def get_legacy_dataframe(self) -> pd.DataFrame:
-        """Возвращает данные в старом формате (для совместимости с smeta_core.py)."""
-        if self.work_materials_cache.empty:
+        """Возвращает данные в старом формате (для совместимости с smeta_core.py).
+        Работы без материалов возвращаются с '-' в поле 'Материал'."""
+        if self.works_cache.empty:
             return pd.DataFrame(columns=LEGACY_COLS)
         
         result = []
-        for _, link in self.work_materials_cache.iterrows():
-            work = self.works_cache[self.works_cache['id'] == link['work_id']].iloc[0]
-            mat = self.materials_cache[self.materials_cache['id'] == link['material_id']].iloc[0]
+        for _, work in self.works_cache.iterrows():
+            work_id = work['id']
+            mask = self.work_materials_cache['work_id'] == work_id
+            links = self.work_materials_cache[mask]
             
-            result.append({
-                'Работа': work['name'], 'Ед_изм_раб': work['unit'],
-                'Материал': mat['name'], 'Ед_изм': mat['unit'],
-                'Расход_1': link['consumption_1'], 'Цена_мат_1': mat['price_1'], 'Цена_раб_1': work['price_1'],
-                'Расход_2': link['consumption_2'], 'Цена_мат_2': mat['price_2'], 'Цена_раб_2': work['price_2']
-            })
+            if links.empty:
+                # Работа без материалов — возвращаем строку с '-'
+                result.append({
+                    'Работа': work['name'], 'Ед_изм_раб': work['unit'],
+                    'Материал': '-', 'Ед_изм': '-',
+                    'Расход_1': 0.0, 'Цена_мат_1': 0.0, 'Цена_раб_1': work['price_1'],
+                    'Расход_2': 0.0, 'Цена_мат_2': 0.0, 'Цена_раб_2': work['price_2']
+                })
+            else:
+                for _, link in links.iterrows():
+                    mat = self.materials_cache[self.materials_cache['id'] == link['material_id']].iloc[0]
+                    result.append({
+                        'Работа': work['name'], 'Ед_изм_раб': work['unit'],
+                        'Материал': mat['name'], 'Ед_изм': mat['unit'],
+                        'Расход_1': link['consumption_1'], 'Цена_мат_1': mat['price_1'], 'Цена_раб_1': work['price_1'],
+                        'Расход_2': link['consumption_2'], 'Цена_мат_2': mat['price_2'], 'Цена_раб_2': work['price_2']
+                    })
         
         return pd.DataFrame(result, columns=LEGACY_COLS)
     

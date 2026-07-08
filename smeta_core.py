@@ -2,7 +2,6 @@
 """
 smeta_core.py
 Бизнес-логика приложения "Сметчик PRO", не зависящая от tkinter.
-Вынесена в отдельный модуль.
 """
 import os
 import math
@@ -23,107 +22,160 @@ EMPTY_TOKENS = ("", "-", "0", "nan", "none", "NaN")
 # --------------------------------------------------------------------------
 def to_float(val, default=0.0):
     """Надёжно парсит число, поддерживает запятую как десятичный разделитель."""
-    if val is None: return default
+    if val is None:
+        return default
     if isinstance(val, (int, float)):
-        if isinstance(val, float) and math.isnan(val): return default
+        if isinstance(val, float) and math.isnan(val):
+            return default
         return float(val)
+    # ✅ ИСПРАВЛЕНО: убран лишний пробел перед \xa0
     s = str(val).strip().replace('\xa0', '').replace(' ', '').replace(',', '.')
-    if s == "" or s.lower() in ("nan", "none", "-"): return default
-    try: return float(s)
-    except ValueError: return default
+    if s == "" or s.lower() in ("nan", "none", "-"):
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        return default
 
-def is_section(name) -> bool: return str(name).strip().startswith("РАЗДЕЛ:")
-def is_work(name) -> bool: return str(name).strip().startswith("Работа:")
-def is_total(name) -> bool: return str(name).strip().startswith("ИТОГО ПО УЗЛУ")
-def is_material(name) -> bool: return str(name).strip().startswith(">") # Унифицировано 4 пробела
+def is_section(name) -> bool:
+    return str(name).strip().startswith("РАЗДЕЛ:")
+
+def is_work(name) -> bool:
+    return str(name).strip().startswith("Работа:")
+
+def is_total(name) -> bool:
+    return str(name).strip().startswith("ИТОГО ПО УЗЛУ")
+
+def is_material(name) -> bool:
+    return str(name).strip().startswith(">")
 
 def clean_name(name) -> str:
-    """Убирает служебные префиксы ('Работа:', '    > ') из имени."""
+    """Убирает служебные префиксы ('Работа:', '>', пробелы) из имени."""
     s = str(name).strip()
-    if s.startswith("Работа: "): s = s[len("Работа: "):]
-    elif s.startswith("    > "): s = s[4:]
+    if s.startswith("Работа: "):
+        s = s[len("Работа: "):]
+    elif s.startswith(">"):
+        s = s[1:]
     return s.strip()
 
 # --------------------------------------------------------------------------
 # Работа с базой (DataFrame)
 # --------------------------------------------------------------------------
 def migrate_legacy_df(df):
-    """Если в базе старый формат (один вариант цены) — переносит значения в '_1' и копирует в '_2'."""
+    """Если в базе старый формат (один вариант цены) — переносит значения в '_1' колонки и копирует их же в '_2'."""
     has_legacy = all(c in df.columns for c in LEGACY_COLS)
     has_new = all(c in df.columns for c in COLS)
 
     if has_new:
         for c in COLS:
-            if c not in df.columns: df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
+            if c not in df.columns:
+                df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
         return df[COLS].copy()
 
     if has_legacy:
         out = df.copy()
-        out['Расход_1'] = out['Расход']; out['Цена_мат_1'] = out['Цена_мат']; out['Цена_раб_1'] = out['Цена_раб']
-        out['Расход_2'] = out['Расход']; out['Цена_мат_2'] = out['Цена_мат']; out['Цена_раб_2'] = out['Цена_раб']
+        out['Расход_1'] = out['Расход']
+        out['Цена_мат_1'] = out['Цена_мат']
+        out['Цена_раб_1'] = out['Цена_раб']
+        out['Расход_2'] = out['Расход']
+        out['Цена_мат_2'] = out['Цена_мат']
+        out['Цена_раб_2'] = out['Цена_раб']
         return out[COLS].copy()
 
     for c in COLS:
-        if c not in df.columns: df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
+        if c not in df.columns:
+            df[c] = 0.0 if c.startswith(('Расход', 'Цена')) else "-"
     return df[COLS].copy()
 
 def build_work_block(work_name, vol, db, next_num, db_manager=None):
-    """Строит строки сметы (работа + материалы + строка ИТОГО ПО УЗЛУ)."""
+    """Строит строки сметы (работа + материалы + строка ИТОГО ПО УЗЛУ).
+    Если db_manager предоставлен — использует нормализованную БД."""
     if db_manager is not None:
         work_data = db_manager.get_work_with_materials(work_name)
-        if work_data is None: return None
+        if work_data is None:
+            return None
         
-        work = work_data['work']; materials = work_data['materials']
+        work = work_data['work']
+        materials = work_data['materials']
+        
         unit_w = str(work['unit'])
-        price_w1 = to_float(work['price_1']); price_w2 = to_float(work['price_2'])
+        price_w1 = to_float(work['price_1'])
+        price_w2 = to_float(work['price_2'])
         vol = to_float(vol)
         
-        work_cost1 = round(vol * price_w1, 2); work_cost2 = round(vol * price_w2, 2)
+        work_cost1 = round(vol * price_w1, 2)
+        work_cost2 = round(vol * price_w2, 2)
+        
         rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
                  "-", vol, price_w2, work_cost2)]
         
-        mat_total1 = 0.0; mat_total2 = 0.0
+        mat_total1 = 0.0
+        mat_total2 = 0.0
         for mat in materials:
             mat_name = str(mat['name']).strip()
-            if mat_name.lower() in EMPTY_TOKENS: continue
-            rashod1 = to_float(mat['consumption_1']); price_m1 = to_float(mat['price_1'])
-            rashod2 = to_float(mat['consumption_2']); price_m2 = to_float(mat['price_2'])
-            qty1 = round(rashod1 * vol, 3); qty2 = round(rashod2 * vol, 3)
-            cost1 = round(qty1 * price_m1, 2); cost2 = round(qty2 * price_m2, 2)
-            mat_total1 += cost1; mat_total2 += cost2
-            rows.append(("", f"    > {mat_name}", str(mat['unit']), rashod1, qty1, price_m1, cost1,
-                         rashod2, qty2, price_m2, cost2))
+            if mat_name.lower() in EMPTY_TOKENS:
+                continue
+            
+            rashod1 = to_float(mat['consumption_1'])
+            price_m1 = to_float(mat['price_1'])
+            rashod2 = to_float(mat['consumption_2'])
+            price_m2 = to_float(mat['price_2'])
+            
+            qty1 = round(rashod1 * vol, 3)
+            qty2 = round(rashod2 * vol, 3)
+            cost1 = round(qty1 * price_m1, 2)
+            cost2 = round(qty2 * price_m2, 2)
+            
+            mat_total1 += cost1
+            mat_total2 += cost2
+            
+            rows.append(("", f"    > {mat_name}", str(mat['unit']), 
+                        rashod1, qty1, price_m1, cost1,
+                        rashod2, qty2, price_m2, cost2))
         
-        combined1 = round(work_cost1 + mat_total1, 2); combined2 = round(work_cost2 + mat_total2, 2)
+        combined1 = round(work_cost1 + mat_total1, 2)
+        combined2 = round(work_cost2 + mat_total2, 2)
         rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
                      "", "", "Сумма:", combined2))
         return rows
     else:
         # Старый метод с DataFrame
         items = db[db['Работа'].astype(str).str.strip() == str(work_name).strip()]
-        if items.empty: return None
+        if items.empty:
+            return None
         first = items.iloc[0]
         unit_w = str(first['Ед_изм_раб'])
-        price_w1 = to_float(first['Цена_раб_1']); price_w2 = to_float(first['Цена_раб_2'])
+        price_w1 = to_float(first['Цена_раб_1'])
+        price_w2 = to_float(first['Цена_раб_2'])
         vol = to_float(vol)
         
-        work_cost1 = round(vol * price_w1, 2); work_cost2 = round(vol * price_w2, 2)
+        work_cost1 = round(vol * price_w1, 2)
+        work_cost2 = round(vol * price_w2, 2)
+        
         rows = [(next_num, f"Работа: {work_name}", unit_w, "-", vol, price_w1, work_cost1,
                  "-", vol, price_w2, work_cost2)]
         
-        mat_total1 = 0.0; mat_total2 = 0.0
+        mat_total1 = 0.0
+        mat_total2 = 0.0
         for _, r in items.iterrows():
             mat_name = str(r['Материал']).strip()
-            if mat_name.lower() in EMPTY_TOKENS: continue
-            rashod1 = to_float(r['Расход_1']); price_m1 = to_float(r['Цена_мат_1'])
-            rashod2 = to_float(r['Расход_2']); price_m2 = to_float(r['Цена_мат_2'])
-            qty1 = round(rashod1 * vol, 3); qty2 = round(rashod2 * vol, 3)
-            cost1 = round(qty1 * price_m1, 2); cost2 = round(qty2 * price_m2, 2)
-            mat_total1 += cost1; mat_total2 += cost2
+            if mat_name.lower() in EMPTY_TOKENS:
+                continue
+            rashod1 = to_float(r['Расход_1'])
+            price_m1 = to_float(r['Цена_мат_1'])
+            rashod2 = to_float(r['Расход_2'])
+            price_m2 = to_float(r['Цена_мат_2'])
+            qty1 = round(rashod1 * vol, 3)
+            qty2 = round(rashod2 * vol, 3)
+            cost1 = round(qty1 * price_m1, 2)
+            cost2 = round(qty2 * price_m2, 2)
+            mat_total1 += cost1
+            mat_total2 += cost2
             rows.append(("", f"    > {mat_name}", str(r['Ед_изм']), rashod1, qty1, price_m1, cost1,
                          rashod2, qty2, price_m2, cost2))
         
-        combined1 = round(work_cost1 + mat_total1, 2); combined2 = round(work_cost2 + mat_total2, 2)
+        combined1 = round(work_cost1 + mat_total1, 2)
+        combined2 = round(work_cost2 + mat_total2, 2)
         rows.append(("", f"ИТОГО ПО УЗЛУ: {work_name}", "", "", "", "Сумма:", combined1,
                      "", "", "Сумма:", combined2))
         return rows
@@ -131,7 +183,9 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
 def rebuild_smeta(rows):
     """Полная пересборка сметы — единая точка пересчёта."""
     cleaned = [r for r in rows if not is_total(str(r[1]))]
-    out = []; next_num = 1; work_vol = 1.0
+    out = []
+    next_num = 1
+    work_vol = 1.0
     node_work_name = None
     node_work_cost1 = node_work_cost2 = 0.0
     node_mat_cost1 = node_mat_cost2 = 0.0
@@ -142,38 +196,56 @@ def rebuild_smeta(rows):
             out.append(("", f"ИТОГО ПО УЗЛУ: {node_work_name}", "", "", "", "Сумма:",
                         round(node_work_cost1 + node_mat_cost1, 2),
                         "", "", "Сумма:", round(node_work_cost2 + node_mat_cost2, 2)))
-        node_work_name = None; node_work_cost1 = node_work_cost2 = node_mat_cost1 = node_mat_cost2 = 0.0
+        node_work_name = None
+        node_work_cost1 = node_work_cost2 = node_mat_cost1 = node_mat_cost2 = 0.0
 
     for raw in cleaned:
-        vals = list(raw); name = str(vals[1]).strip()
-        if is_section(name): flush_node(); out.append(tuple(vals)); continue
+        vals = list(raw)
+        name = str(vals[1]).strip()
+
+        if is_section(name):
+            flush_node()
+            out.append(tuple(vals))
+            continue
 
         if is_work(name):
             flush_node()
             user_vol = to_float(vals[4], 0.0)
             work_vol = user_vol if user_vol > 0 else 1.0
             
-            price1 = to_float(vals[5]); price2 = to_float(vals[9])
-            vals[0] = next_num; next_num += 1
-            vals[4] = work_vol; vals[8] = work_vol
-            vals[6] = round(work_vol * price1, 2); vals[10] = round(work_vol * price2, 2)
+            price1 = to_float(vals[5])
+            price2 = to_float(vals[9])
+            vals[0] = next_num
+            next_num += 1
+            vals[4] = work_vol
+            vals[8] = work_vol
+            vals[6] = round(work_vol * price1, 2)
+            vals[10] = round(work_vol * price2, 2)
             node_work_name = name.replace("Работа: ", "").strip()
             node_work_cost1, node_work_cost2 = vals[6], vals[10]
-            out.append(tuple(vals)); continue
+            out.append(tuple(vals))
+            continue
 
         if is_material(name):
-            norm1 = to_float(vals[3]); norm2 = to_float(vals[7])
-            calc_qty1 = round(norm1 * work_vol, 3); calc_qty2 = round(norm2 * work_vol, 3)
+            norm1 = to_float(vals[3])
+            norm2 = to_float(vals[7])
+            calc_qty1 = round(norm1 * work_vol, 3)
+            calc_qty2 = round(norm2 * work_vol, 3)
             
-            cur_qty1 = to_float(vals[4], 0.0); cur_qty2 = to_float(vals[8], 0.0)
+            cur_qty1 = to_float(vals[4], 0.0)
+            cur_qty2 = to_float(vals[8], 0.0)
             vals[4] = cur_qty1 if cur_qty1 > 0 else calc_qty1
             vals[8] = cur_qty2 if cur_qty2 > 0 else calc_qty2
 
-            price1 = to_float(vals[5]); price2 = to_float(vals[9])
+            price1 = to_float(vals[5])
+            price2 = to_float(vals[9])
             vals[0] = ""
-            vals[6] = round(vals[4] * price1, 2); vals[10] = round(vals[8] * price2, 2)
-            node_mat_cost1 += vals[6]; node_mat_cost2 += vals[10]
-            out.append(tuple(vals)); continue
+            vals[6] = round(vals[4] * price1, 2)
+            vals[10] = round(vals[8] * price2, 2)
+            node_mat_cost1 += vals[6]
+            node_mat_cost2 += vals[10]
+            out.append(tuple(vals))
+            continue
 
         out.append(tuple(vals))
 
@@ -185,7 +257,9 @@ def compute_grand_totals(rows):
     t1 = t2 = 0.0
     for vals in rows:
         name = str(vals[1]).strip()
-        if is_total(name): t1 += to_float(vals[6]); t2 += to_float(vals[10])
+        if is_total(name):
+            t1 += to_float(vals[6])
+            t2 += to_float(vals[10])
     return round(t1, 2), round(t2, 2)
 
 # --------------------------------------------------------------------------
@@ -201,7 +275,6 @@ def parse_exported_sheet(sheet_values):
     lifting_trash = (0.0, 0.0)
     sequence = []
 
-    # Заголовок сметы - ищем в первых строках
     if sheet_values:
         for row in sheet_values[:3]:
             for cell in row:
@@ -217,7 +290,6 @@ def parse_exported_sheet(sheet_values):
         col0 = row[0] if len(row) > 0 else None
         col1 = row[1] if len(row) > 1 else None
         
-        # Преобразуем значения в строки с обработкой NaN
         def safe_str(val):
             if val is None:
                 return ""
@@ -228,24 +300,20 @@ def parse_exported_sheet(sheet_values):
         str0 = safe_str(col0)
         str1 = safe_str(col1)
         
-        # Пропускаем строки заголовков
         if "№ п/п" in str0 or "№" in str0:
             continue
         if "Наименование" in str1 and "Ед. изм" in str(row[2] if len(row) > 2 else ""):
             continue
-        # Пропускаем строки с номерами колонок (1, 2, 3, 4, 5, 6, 7)
         if str0.isdigit() and str1.isdigit() and int(str0) < 10 and int(str1) < 10:
             continue
+            
+        if str1.startswith("РАЗДЕЛ:") or (str0 and not str0.replace('.', '').isdigit() and not str1):
+            if str0 and len(str0) > 5 and not str0.replace('.', '').isdigit():
+                sequence.append(('section', str0.replace("РАЗДЕЛ:", "").strip()))
+                continue
         
-        # Проверяем, является ли строка разделом (начинается с "РАЗДЕЛ:")
-        if str1.startswith("РАЗДЕЛ:") or (str0.startswith("РАЗДЕЛ:") and not str1):
-            section_text = str1 if str1.startswith("РАЗДЕЛ:") else str0
-            sequence.append(('section', section_text.replace("РАЗДЕЛ:", "").strip()))
-            continue
-        
-        # Если col1 пустой, но col0 содержит текст - это тоже может быть раздел
         if not str1 and str0 and not str0.replace('.', '').isdigit() and len(str0) > 3:
-            if "Гидроизоляция" in str0 or "Устройство" in str0 or "Монтаж" in str0 or "Подготовка" in str0:
+            if "Гидроизоляция" in str0 or "Устройство" in str0 or "Монтаж" in str0:
                 sequence.append(('section', str0))
                 continue
         
@@ -256,7 +324,6 @@ def parse_exported_sheet(sheet_values):
         if not name:
             continue
 
-        # Пропускаем служебные строки
         if name.startswith("в т.ч.") or name.startswith("- материалы") or name.startswith("- работы"):
             continue
         if name.startswith("ИТОГО") or name.startswith("Итого"):
@@ -291,13 +358,11 @@ def parse_exported_sheet(sheet_values):
                 pass
             continue
 
-        # Проверяем, является ли строка работой (есть номер в первой колонке)
         is_numbered = False
         if str0 and str0.replace('.', '').isdigit():
             is_numbered = True
 
         if is_numbered:
-            # Это работа
             try:
                 vol = float(row[4]) if len(row) > 4 and not (isinstance(row[4], float) and math.isnan(row[4])) else 0.0
             except (ValueError, TypeError, IndexError):
@@ -347,15 +412,26 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     headers = ["№ п/п", "Наименование работ и затрат", "Ед. изм.",
                "Норма расхода", "Объём", "Цена за ед., руб.", "Сметная стоимость, руб.",
                "Норма расхода", "Объём", "Цена за ед., руб.", "Сметная стоимость, руб."]
-    for c, h in enumerate(headers): ws.write(2, c, h, f_header)
+    for c, h in enumerate(headers):
+        ws.write(2, c, h, f_header)
 
-    ws.set_column(0, 0, 6); ws.set_column(1, 1, 52); ws.set_column(2, 2, 9)
-    ws.set_column(3, 3, 11); ws.set_column(4, 4, 11); ws.set_column(5, 5, 13); ws.set_column(6, 6, 16)
-    ws.set_column(7, 7, 11); ws.set_column(8, 8, 11); ws.set_column(9, 9, 13); ws.set_column(10, 10, 16)
+    ws.set_column(0, 0, 6)
+    ws.set_column(1, 1, 52)
+    ws.set_column(2, 2, 9)
+    ws.set_column(3, 3, 11)
+    ws.set_column(4, 4, 11)
+    ws.set_column(5, 5, 13)
+    ws.set_column(6, 6, 16)
+    ws.set_column(7, 7, 11)
+    ws.set_column(8, 8, 11)
+    ws.set_column(9, 9, 13)
+    ws.set_column(10, 10, 16)
     ws.freeze_panes(3, 2)
  
     excel_row = 3
-    i = 0; n = len(rows)
+    i = 0
+    n = len(rows)
+
     workonly_total1_refs, workonly_total2_refs = [], []
     matonly_total1_refs, matonly_total2_refs = [], []
     seen_work1, seen_work2 = {}, {}
@@ -370,24 +446,32 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
             ws.write_formula(row_idx, col_idx, f"={RC(ref_row, ref_col)}", fmt, value)
 
     while i < n:
-        vals = rows[i]; name = str(vals[1]).strip()
+        vals = rows[i]
+        name = str(vals[1]).strip()
 
         if name.startswith("РАЗДЕЛ: "):
             section_title = name.replace("РАЗДЕЛ: ", "").strip()
             ws.merge_range(excel_row, 0, excel_row, 10, section_title, f_section)
-            excel_row += 1; i += 1; continue
+            excel_row += 1
+            i += 1
+            continue
 
         if name.startswith("Работа: "):
             work_name = name.replace("Работа: ", "").strip()
             unit_w = str(vals[2])
-            try: work_num = int(vals[0])
-            except (TypeError, ValueError): work_num = ""
+            try:
+                work_num = int(vals[0])
+            except (TypeError, ValueError):
+                work_num = ""
             vol = to_float(vals[4])
-            price_w1 = to_float(vals[5]); price_w2 = to_float(vals[9])
+            price_w1 = to_float(vals[5])
+            price_w2 = to_float(vals[9])
 
-            j = i + 1; mats = []
-            while j < n and str(rows[j][1]).strip().startswith("    > "): # 4 пробела
-                mats.append(rows[j]); j += 1
+            j = i + 1
+            mats = []
+            while j < n and str(rows[j][1]).strip().startswith("    > "):
+                mats.append(rows[j])
+                j += 1
 
             row_top = excel_row
             row_workonly = excel_row + 1
@@ -411,7 +495,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
             ws.write(row_workonly, 1, "в т.ч.: - работы:", f_break_txt)
             ws.write_blank(row_workonly, 2, None, f_blank)
             ws.write_blank(row_workonly, 3, None, f_blank)
-            ws.write_blank(row_workonly, 4, None, f_blank) 
+            ws.write_blank(row_workonly, 4, None, f_blank)  
             price_cell(seen_work1, work_name, row_workonly, 5, price_w1, f_break_num)
             ws.write_formula(row_workonly, 6, f"={RC(row_top, 4)}*{RC(row_workonly, 5)}", f_break_num)
             ws.write_blank(row_workonly, 7, None, f_blank)
@@ -423,20 +507,23 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
 
             ws.write_blank(row_matonly, 0, None, f_blank)
             ws.write(row_matonly, 1, "- материалы:", f_break_txt)
-            for c in (2, 3, 4, 5, 7, 8, 9): ws.write_blank(row_matonly, c, None, f_blank)
+            for c in (2, 3, 4, 5, 7, 8, 9):
+                ws.write_blank(row_matonly, c, None, f_blank)
             if mats:
                 ws.write_formula(row_matonly, 6, f"=SUM({RC(row_mat_start, 6)}:{RC(row_mat_end, 6)})", f_break_num)
                 ws.write_formula(row_matonly, 10, f"=SUM({RC(row_mat_start, 10)}:{RC(row_mat_end, 10)})", f_break_num)
             else:
-                ws.write(row_matonly, 6, 0, f_break_num); ws.write(row_matonly, 10, 0, f_break_num)
+                ws.write(row_matonly, 6, 0, f_break_num)
+                ws.write(row_matonly, 10, 0, f_break_num)
             matonly_total1_refs.append(RC(row_matonly, 6))
             matonly_total2_refs.append(RC(row_matonly, 10))
 
             for k, mvals in enumerate(mats):
                 r = row_mat_start + k
-                mat_name = str(mvals[1]).replace("    > ", "").strip() # 4 пробела
+                mat_name = str(mvals[1]).replace("    > ", "").strip()
                 unit_m = str(mvals[2])
-                norm1 = to_float(mvals[3]); norm2 = to_float(mvals[7])
+                norm1 = to_float(mvals[3])
+                norm2 = to_float(mvals[7])
 
                 ws.write_blank(r, 0, None, f_blank)
                 ws.write(r, 1, mat_name, f_mat_txt)
@@ -450,7 +537,8 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
                 price_cell(seen_mat2, mat_name, r, 9, to_float(mvals[9]), f_mat_num)
                 ws.write_formula(r, 10, f"={RC(r, 8)}*{RC(r, 9)}", f_mat_num)
 
-            excel_row = row_mat_end + 1; i = j
+            excel_row = row_mat_end + 1
+            i = j
         else:
             i += 1
 
@@ -458,14 +546,18 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         meta_df = pd.DataFrame(meta_rows, columns=COLS).drop_duplicates().reset_index(drop=True)
         if not meta_df.empty:
             ws_meta = wb.add_worksheet("Meta")
-            for c, h in enumerate(COLS): ws_meta.write(0, c, h)
+            for c, h in enumerate(COLS):
+                ws_meta.write(0, c, h)
             for r_idx, row in enumerate(meta_df.itertuples(index=False), start=1):
-                for c_idx, val in enumerate(row): ws_meta.write(r_idx, c_idx, val)
+                for c_idx, val in enumerate(row):
+                    ws_meta.write(r_idx, c_idx, val)
 
     row_gap = excel_row + 1
     row_total = row_gap + 1
-    row_works = row_total + 1; row_mats = row_total + 2
-    row_overhead = row_total + 3; row_lifting = row_total + 4
+    row_works = row_total + 1
+    row_mats = row_total + 2
+    row_overhead = row_total + 3
+    row_lifting = row_total + 4
     row_trash = row_total + 5
 
     works_f1 = "+".join(workonly_total1_refs) if workonly_total1_refs else "0"
