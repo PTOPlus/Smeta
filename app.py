@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Сметчик PRO 5.1
+Сметчик PRO 5.2
 Изменения: поддержка двух вариантов цены, сравнение экономии,
 учёт доп. расходов, корректный импорт/экспорт, фикс ручных правок,
-нормализованная база данных через Parquet.
+нормализованная база данных через SQLite.
 """
 import os
 import re
@@ -23,6 +23,7 @@ except ImportError:
     HAS_DB_MANAGER = False
 
 SETTINGS_FILE = 'settings.json'
+DRAFT_FILE = 'smeta_draft.json'  # файл черновика сметы
 
 # --------------------------------------------------------------------------
 # Настройки
@@ -158,7 +159,7 @@ def add_context_menu(widget):
 class SmetaApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Сметчик PRO 5.1")
+        self.root.title("Сметчик PRO 5.2")
         self.root.geometry("1650x900")
         
         settings = load_settings()
@@ -178,8 +179,16 @@ class SmetaApp:
 
         # ✅ ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА БД
         if HAS_DB_MANAGER:
-            db_name = self.active_db_filename.rsplit('.', 1)[0]
-            self.db_manager = DatabaseManager(self.db_folder, db_name)
+            if self.active_db_filename.lower().endswith('.db'):
+                db_name = self.active_db_filename.rsplit('.', 1)[0]
+                self.db_manager = DatabaseManager(self.db_folder, db_name)
+            elif self.active_db_filename.lower().endswith('.xlsx'):
+                # Excel база — без db_manager
+                self.db_manager = None
+            else:
+                # По умолчанию — SQLite
+                db_name = self.active_db_filename.rsplit('.', 1)[0]
+                self.db_manager = DatabaseManager(self.db_folder, db_name)
         else:
             self.db_manager = None
 
@@ -210,9 +219,140 @@ class SmetaApp:
         self.apply_column_widths()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.refresh_db_list()
+        
+        # Предлагаем загрузить черновик, если он существует
+        self.root.after(500, self._ask_load_draft)
 
     def show_about(self):
-        messagebox.showinfo("О программе", "Сметчик PRO 5.1\n\nПоддержка двух вариантов цены, учёт доп. расходов, автоматический расчёт экономии, нормализованная база данных.")
+        messagebox.showinfo("О программе", "Сметчик PRO 5.2\n\nПоддержка двух вариантов цены, учёт доп. расходов, автоматический расчёт экономии, нормализованная база данных.")
+
+    # --------------------------------------------------------------------------
+    # Черновик сметы
+    # --------------------------------------------------------------------------
+    def _get_draft_path(self):
+        """Возвращает путь к файлу черновика."""
+        return os.path.join(self.db_folder, DRAFT_FILE)
+
+    def _has_draft(self):
+        """Проверяет, существует ли черновик."""
+        return os.path.exists(self._get_draft_path())
+
+    def _save_draft(self):
+        """Сохраняет текущую смету как черновик."""
+        rows = self._gather_rows()
+        if not rows:
+            return
+        
+        # Удаляем черновик, если смета пуста
+        if len(rows) == 0:
+            draft_path = self._get_draft_path()
+            if os.path.exists(draft_path):
+                try:
+                    os.remove(draft_path)
+                except Exception:
+                    pass
+            return
+
+        draft_data = {
+            'title': self.title_entry.get().strip(),
+            'rows': [list(row) for row in rows],
+            'extra_entries': {
+                'overhead1': str(self.extra_entries['overhead1'].get()),
+                'overhead2': str(self.extra_entries['overhead2'].get()),
+                'lift1': str(self.extra_entries['lift1'].get()),
+                'lift2': str(self.extra_entries['lift2'].get()),
+                'trash1': str(self.extra_entries['trash1'].get()),
+                'trash2': str(self.extra_entries['trash2'].get()),
+            },
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        
+        try:
+            draft_path = self._get_draft_path()
+            with open(draft_path, 'w', encoding='utf-8') as f:
+                json.dump(draft_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Ошибка сохранения черновика: {e}")
+
+    def _load_draft(self):
+        """Загружает черновик сметы."""
+        if not self._has_draft():
+            return False
+
+        try:
+            draft_path = self._get_draft_path()
+            with open(draft_path, 'r', encoding='utf-8') as f:
+                draft_data = json.load(f)
+
+            # Очищаем текущую смету
+            self.tree_smeta.delete(*self.tree_smeta.get_children())
+
+            # Загружаем заголовок
+            self.title_entry.delete(0, tk.END)
+            if draft_data.get('title'):
+                self.title_entry.insert(0, draft_data['title'])
+
+            # Загружаем строки
+            for row in draft_data.get('rows', []):
+                vals = tuple(row)
+                tags = ("section",) if sc.is_section(str(vals[1])) else ()
+                self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
+
+            # Загружаем доп расходы
+            extra = draft_data.get('extra_entries', {})
+            for key in ('overhead1', 'overhead2', 'lift1', 'lift2', 'trash1', 'trash2'):
+                if key in self.extra_entries and key in extra:
+                    self.extra_entries[key].delete(0, tk.END)
+                    self.extra_entries[key].insert(0, str(extra[key]))
+
+            # Пересчитываем итоги
+            self.full_rebuild()
+
+            print(f"Черновик загружен: {draft_data.get('timestamp', 'unknown')}")
+            return True
+        except Exception as e:
+            print(f"Ошибка загрузки черновика: {e}")
+            return False
+
+    def _ask_load_draft(self):
+        """Предлагает загрузить черновик при старте."""
+        if not self._has_draft():
+            return
+
+        draft_path = self._get_draft_path()
+        try:
+            with open(draft_path, 'r', encoding='utf-8') as f:
+                draft_data = json.load(f)
+            timestamp = draft_data.get('timestamp', 'неизвестно')
+            row_count = len(draft_data.get('rows', []))
+        except Exception:
+            timestamp = 'неизвестно'
+            row_count = 0
+
+        result = messagebox.askyesno(
+            "Найден черновик сметы",
+            f"В предыдущей сессии была начата смета ({row_count} строк, сохранено: {timestamp}).\n\n"
+            f"Загрузить черновик и продолжить работу?"
+        )
+
+        if result:
+            self._load_draft()
+            messagebox.showinfo("Готово", "Черновик сметы загружен.")
+        else:
+            # Пользователь отказался — удаляем черновик
+            try:
+                os.remove(draft_path)
+            except Exception:
+                pass
+
+    def _manual_save_draft(self):
+        """Явное сохранение черновика по кнопке."""
+        self._save_draft()
+        messagebox.showinfo("Готово", "Черновик сметы сохранён.\nОн будет автоматически загружен при следующем запуске программы.")
+
+    # --------------------------------------------------------------------------
+    # Настройки
+    # --------------------------------------------------------------------------
 
     def open_settings(self):
         settings_win = tk.Toplevel(self.root)
@@ -330,19 +470,32 @@ class SmetaApp:
                     pass
 
     def on_closing(self):
-        """Обработчик закрытия окна — сохраняет ширины колонок."""
+        """Обработчик закрытия окна — сохраняет ширины колонок и черновик сметы."""
         self.save_column_widths()
+        self._save_draft()
         self.root.destroy()
 
     def _load_db(self):
-        """Загружает базу данных (с поддержкой Parquet и Excel)."""
+        """Загружает базу данных (с поддержкой SQLite и Excel)."""
         if self.db_manager is not None:
             return self.db_manager.get_legacy_dataframe()
         else:
+            # Если это SQLite-база, а db_manager по какой-то причине не инициализирован
+            # — создаём его на лету
+            if (self.db_file and self.db_file.lower().endswith('.db')
+                    and HAS_DB_MANAGER):
+                db_name = os.path.splitext(os.path.basename(self.db_file))[0]
+                self.db_manager = DatabaseManager(self.db_folder, db_name)
+                return self.db_manager.get_legacy_dataframe()
+            
             if not os.path.exists(self.db_file):
                 return pd.DataFrame(columns=sc.COLS)
             try:
                 raw = pd.read_excel(self.db_file)
+            except ValueError as e:
+                if 'filetype' in str(e):
+                    return pd.DataFrame(columns=sc.COLS)
+                raise
             except Exception as e:
                 messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
                 return pd.DataFrame(columns=sc.COLS)
@@ -524,7 +677,7 @@ class SmetaApp:
             work_name = data['Работа']
             
             if self.db_manager is not None:
-                # ✅ Сохранение через нормализованную БД (Parquet)
+                # ✅ Сохранение через нормализованную БД (SQLite)
                 work = self.db_manager.get_work_by_name(work_name)
                 if work is None:
                     work_id = self.db_manager.add_work(
@@ -537,10 +690,10 @@ class SmetaApp:
                         work_id, unit=data['Ед_изм_раб'],
                         price_1=data['Цена_раб_1'], price_2=data['Цена_раб_2']
                     )
-                
+
                 # ✅ Очищаем старые связи перед добавлением новых
                 self.db_manager.delete_work_material_links_by_work(work_id)
-                
+
                 mat_name = data['Материал']
                 if mat_name != "-":
                     mat = self.db_manager.get_material_by_name(mat_name)
@@ -559,7 +712,7 @@ class SmetaApp:
                         work_id, mat_id,
                         data['Расход_1'], data['Расход_2']
                     )
-                
+
                 self.db_manager.flush()
                 self.db = self.db_manager.get_legacy_dataframe()
             else:
@@ -568,9 +721,7 @@ class SmetaApp:
                         & (self.db['Материал'].astype(str).str.strip() == data['Материал']))
                 self.db = self.db[~mask].reset_index(drop=True)
                 new_row = pd.DataFrame([data], columns=sc.COLS)
-                
                 self.db = pd.concat([self.db, new_row], ignore_index=True)
-                self.db = pd.concat([self.db, pd.DataFrame([data])[sc.COLS]], ignore_index=True)
                 os.makedirs(self.db_folder, exist_ok=True)
                 self.db.to_excel(self.db_file, index=False)
             
@@ -731,25 +882,21 @@ class SmetaApp:
         if not os.path.exists(self.db_folder):
             os.makedirs(self.db_folder, exist_ok=True)
         files = os.listdir(self.db_folder)
-        
+
         # Собираем Excel файлы
         db_files = [f for f in files if f.lower().endswith('.xlsx')]
-        
-        # Собираем Parquet базы (группы из 3 файлов)
+
+        # Собираем SQLite базы (.db файлы)
         if HAS_DB_MANAGER:
-            parquet_bases = set()
+            sqlite_bases = set()
             for f in files:
-                if f.lower().endswith('_works.parquet'):
-                    base_name = f[:-len('_works.parquet')]
-                    if (os.path.exists(os.path.join(self.db_folder, f'{base_name}_works.parquet')) and
-                        os.path.exists(os.path.join(self.db_folder, f'{base_name}_materials.parquet')) and
-                        os.path.exists(os.path.join(self.db_folder, f'{base_name}_work_materials.parquet'))):
-                        parquet_bases.add(f'{base_name}.parquet')
-            db_files.extend(sorted(parquet_bases))
-        
+                if f.lower().endswith('.db'):
+                    sqlite_bases.add(f)
+            db_files.extend(sorted(sqlite_bases))
+
         db_files = sorted(db_files)
         self.db_combo['values'] = db_files
-        
+
         if self.active_db_filename in db_files:
             self.db_combo.set(self.active_db_filename)
         elif db_files:
@@ -760,18 +907,18 @@ class SmetaApp:
         new_db = self.db_combo.get()
         if new_db and new_db != self.active_db_filename:
             self.active_db_filename = new_db
-            
-            # Для Parquet баз
-            if new_db.endswith('.parquet') and HAS_DB_MANAGER:
-                db_name = new_db[:-len('.parquet')]
+
+            # Для SQLite баз
+            if new_db.endswith('.db') and HAS_DB_MANAGER:
+                db_name = new_db[:-len('.db')]
                 self.db_manager = DatabaseManager(self.db_folder, db_name)
-                self.db_file = os.path.join(self.db_folder, f'{db_name}_works.parquet')
+                self.db_file = os.path.join(self.db_folder, f'{db_name}.db')
             else:
                 # Excel база
                 if HAS_DB_MANAGER:
                     self.db_manager = None
                 self.db_file = os.path.join(self.db_folder, new_db)
-            
+
             self._save_active_db_to_settings()
             self.db = self._load_db()
             self.refresh_db_table()
@@ -783,32 +930,22 @@ class SmetaApp:
         save_settings(settings)
 
     def create_new_db(self):
-        new_name = simpledialog.askstring("Новая база", "Введите имя файла (например, База_Кровля.xlsx):")
+        new_name = simpledialog.askstring("Новая база", "Введите имя файла (например, База_Кровля.db):")
         if not new_name:
             return
-        new_name = re.sub(r'[<>:"/\\|?*]', '_', new_name)
-        if not new_name.lower().endswith('.xlsx'):
-            new_name += '.xlsx'
+        new_name = re.sub(r'[<>:"/\|?*]', '_', new_name)
+        if not new_name.lower().endswith('.db'):
+            new_name += '.db'
         new_path = os.path.join(self.db_folder, new_name)
         if os.path.exists(new_path):
             return messagebox.showwarning("Внимание", "Файл уже существует.")
-        
-        if self.db_manager:
-            db_name = new_name.replace('.xlsx', '')
-            self.active_db_filename = db_name
-            self.db_manager = DatabaseManager(self.db_folder, db_name)
-            # ВАЖНО: refresh_db_list()/on_db_selected() распознают Parquet-базы
-            # по синтетическому имени "{db_name}.parquet" (см. refresh_db_list).
-            # Раньше здесь combo выставлялся в "{db_name}.xlsx" — on_db_selected
-            # видел расширение .xlsx, считал это Excel-базой, обнулял только что
-            # созданный self.db_manager и подставлял пустой DataFrame. Внешне это
-            # выглядело так, будто созданная база сразу же "пустая" — до тех пор,
-            # пока пользователь вручную не выбирал её в выпадающем списке.
-            display_name = f'{db_name}.parquet'
-        else:
-            pd.DataFrame(columns=sc.COLS).to_excel(new_path, index=False)
-            display_name = new_name
-        
+
+        # Всегда создаём через DatabaseManager (SQLite)
+        db_name = new_name.replace('.db', '')
+        self.active_db_filename = new_name
+        self.db_manager = DatabaseManager(self.db_folder, db_name)
+        display_name = f'{db_name}.db'
+
         self.refresh_db_list()
         self.db_combo.set(display_name)
         self.on_db_selected()
@@ -844,6 +981,7 @@ class SmetaApp:
         add_clipboard_support(self.title_entry)
         add_context_menu(self.title_entry)
         self.title_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.title_entry.bind('<KeyRelease>', lambda e: self._save_draft())  # автосохранение при изменении заголовка
         frame_top = tk.Frame(self.tab_calc, pady=5)
         frame_top.pack(fill=tk.X, padx=10)
         self.work_combo = ttk.Combobox(frame_top, width=120)
@@ -859,6 +997,8 @@ class SmetaApp:
                   command=self.add_to_estimate).pack(side=tk.LEFT, padx=10)
         frame_tools = tk.Frame(self.tab_calc, pady=5)
         frame_tools.pack(fill=tk.X, padx=10)
+        tk.Button(frame_tools, text="💾 Черновик", bg="#795548", fg="white",
+                  command=self._manual_save_draft).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_tools, text="➕ Раздел", bg="#9C27B0", fg="white",
                   command=self.add_section).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_tools, text="➕ Материал", bg="#4CAF50", fg="white",
@@ -909,6 +1049,8 @@ class SmetaApp:
         frame_bottom.pack(fill=tk.X, padx=10)
         tk.Button(frame_bottom, text="📂 Загрузить смету", bg="#607D8B", fg="white",
                   command=self.load_estimate).pack(side=tk.LEFT, padx=5)
+        tk.Button(frame_bottom, text="💾 Сохранить черновик", bg="#795548", fg="white",
+                  command=self._manual_save_draft).pack(side=tk.LEFT, padx=5)
         tk.Button(frame_bottom, text="Выгрузить в Excel", bg="#FF9800", fg="white",
                   command=self.export_excel).pack(side=tk.LEFT, padx=5)
         frame_extra = tk.LabelFrame(self.tab_calc, text="Доп. расходы (учитываются в ИТОГО)", padx=8, pady=4)
@@ -945,6 +1087,7 @@ class SmetaApp:
             tags = ("section",) if sc.is_section(str(vals[1])) else ()
             self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
         self.update_total_sum()
+        self._save_draft()  # автосохранение черновика
 
     def add_section(self):
         self.tree_smeta.insert("", tk.END, values=("", f"{sc.SECTION_PREFIX}Новый раздел", "", "", "", "", "", "", "", "", ""), tags=("section",))
@@ -1001,6 +1144,7 @@ class SmetaApp:
             self.tree_smeta.insert("", tk.END, values=vals)
         if not suppress_total_update:
             self.update_total_sum()
+        self._save_draft()  # автосохранение черновика
 
     def remove_smeta_row(self):
         selected = self.tree_smeta.selection()
@@ -1013,16 +1157,17 @@ class SmetaApp:
         for item in selected:
             self.tree_smeta.delete(item)
         self.full_rebuild()
+        self._save_draft()  # автосохранение черновика
 
     def update_total_sum(self):
         rows = self._gather_rows()
         t1, t2 = sc.compute_grand_totals(rows)
-        oh1 = sc.to_float(self.extra_entries.get('overhead1', {}).get())
-        oh2 = sc.to_float(self.extra_entries.get('overhead2', {}).get())
-        l1 = sc.to_float(self.extra_entries.get('lift1', {}).get())
-        l2 = sc.to_float(self.extra_entries.get('lift2', {}).get())
-        tr1 = sc.to_float(self.extra_entries.get('trash1', {}).get())
-        tr2 = sc.to_float(self.extra_entries.get('trash2', {}).get())
+        oh1 = sc.to_float(self.extra_entries['overhead1'].get())
+        oh2 = sc.to_float(self.extra_entries['overhead2'].get())
+        l1 = sc.to_float(self.extra_entries['lift1'].get())
+        l2 = sc.to_float(self.extra_entries['lift2'].get())
+        tr1 = sc.to_float(self.extra_entries['trash1'].get())
+        tr2 = sc.to_float(self.extra_entries['trash2'].get())
         grand1 = round(t1 + oh1 + l1 + tr1, 2)
         grand2 = round(t2 + oh2 + l2 + tr2, 2)
         saving = round(grand1 - grand2, 2)

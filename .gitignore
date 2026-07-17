@@ -1,6 +1,7 @@
 *.xlsx
-*.parquet
+*.db
+*.db-shm
+*.db-wal
 __pycache__/
-settings.json
+*.json
 *.bak
-KODA.md
