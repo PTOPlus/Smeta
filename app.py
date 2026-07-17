@@ -13,7 +13,6 @@
 import os
 import re
 import json
-import math
 from datetime import datetime
 import pandas as pd
 import tkinter as tk
@@ -349,7 +348,6 @@ class SmetaApp:
         автоподстановки цен.
         """
         settings_win = tk.Toplevel(self.root)
-        settings_win = tk.Toplevel(self.root)
         settings_win.title("Настройки")
         settings_win.geometry("600x380")
         settings_win.resizable(False, False)
@@ -491,53 +489,42 @@ class SmetaApp:
         """
         if self.db_manager is not None:
             return self.db_manager.get_legacy_dataframe()
-        else:
-            # Если это SQLite-база, а db_manager по какой-то причине не инициализирован
-            # — создаём его на лету
-            if (self.db_file and self.db_file.lower().endswith('.db')
-                    and HAS_DB_MANAGER):
-                db_name = os.path.splitext(os.path.basename(self.db_file))[0]
-                self.db_manager = DatabaseManager(self.db_folder, db_name)
-                return self.db_manager.get_legacy_dataframe()
-        """Загружает базу данных (с поддержкой SQLite и Excel)."""
-        if self.db_manager is not None:
+        
+        # Если это SQLite-база, а db_manager по какой-то причине не инициализирован
+        # — создаём его на лету
+        if (self.db_file and self.db_file.lower().endswith('.db')
+                and HAS_DB_MANAGER):
+            db_name = os.path.splitext(os.path.basename(self.db_file))[0]
+            self.db_manager = DatabaseManager(self.db_folder, db_name)
             return self.db_manager.get_legacy_dataframe()
-        else:
-            # Если это SQLite-база, а db_manager по какой-то причине не инициализирован
-            # — создаём его на лету
-            if (self.db_file and self.db_file.lower().endswith('.db')
-                    and HAS_DB_MANAGER):
-                db_name = os.path.splitext(os.path.basename(self.db_file))[0]
-                self.db_manager = DatabaseManager(self.db_folder, db_name)
-                return self.db_manager.get_legacy_dataframe()
-            
-            if not os.path.exists(self.db_file):
+        
+        if not os.path.exists(self.db_file):
+            return pd.DataFrame(columns=sc.COLS)
+        try:
+            raw = pd.read_excel(self.db_file)
+        except ValueError as e:
+            if 'filetype' in str(e):
                 return pd.DataFrame(columns=sc.COLS)
+            raise
+        except Exception as e:
+            messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
+            return pd.DataFrame(columns=sc.COLS)
+        is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS)
+                        and not all(c in raw.columns for c in sc.COLS))
+        migrated = sc.migrate_legacy_df(raw)
+        if is_legacy_only:
             try:
-                raw = pd.read_excel(self.db_file)
-            except ValueError as e:
-                if 'filetype' in str(e):
-                    return pd.DataFrame(columns=sc.COLS)
-                raise
+                backup_path = self.db_file.rsplit('.', 1)[0] + "_backup_old_format.xlsx"
+                if not os.path.exists(backup_path):
+                    raw.to_excel(backup_path, index=False)
+                migrated.to_excel(self.db_file, index=False)
+                messagebox.showinfo("База обновлена", 
+                    f"Формат обновлён под два варианта цены.\n"
+                    f"Резервная копия: {os.path.basename(backup_path)}")
             except Exception as e:
-                messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
-                return pd.DataFrame(columns=sc.COLS)
-            is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS)
-                            and not all(c in raw.columns for c in sc.COLS))
-            migrated = sc.migrate_legacy_df(raw)
-            if is_legacy_only:
-                try:
-                    backup_path = self.db_file.rsplit('.', 1)[0] + "_backup_old_format.xlsx"
-                    if not os.path.exists(backup_path):
-                        raw.to_excel(backup_path, index=False)
-                    migrated.to_excel(self.db_file, index=False)
-                    messagebox.showinfo("База обновлена", 
-                        f"Формат обновлён под два варианта цены.\n"
-                        f"Резервная копия: {os.path.basename(backup_path)}")
-                except Exception as e:
-                    messagebox.showwarning("Внимание", 
-                        f"База мигрирована в памяти, но не удалось сохранить файл:\n{e}")
-            return migrated
+                messagebox.showwarning("Внимание", 
+                    f"База мигрирована в памяти, но не удалось сохранить файл:\n{e}")
+        return migrated
 
     def setup_db_tab(self):
         """Настраивает вкладку «Справочник»: поля ввода, кнопки, дерево базы данных."""
@@ -1008,31 +995,6 @@ class SmetaApp:
             self.editing_work_id = None
             self.btn_edit.config(state="disabled")
             return
-        sel = self.tree_db.selection()
-        if not sel:
-            self.editing_work_id = None
-            self.btn_edit.config(state="disabled")
-            return
-        try:
-            idx = int(sel[0])
-            row = self.db.loc[idx]
-            work_name = str(row['Работа']).strip()
-            # Находим ID работы в db_manager
-            if self.db_manager is not None:
-                work = self.db_manager.get_work_by_name(work_name)
-                if work is not None:
-                    self.editing_work_id = int(work['id'])
-                    self.btn_edit.config(state="normal")
-                else:
-                    self.editing_work_id = None
-                    self.btn_edit.config(state="disabled")
-            else:
-                self.editing_work_id = None
-                self.btn_edit.config(state="disabled")
-        except (KeyError, ValueError):
-            self.editing_work_id = None
-            self.btn_edit.config(state="disabled")
-            return
         self.work_text.delete("1.0", tk.END)
         self.work_text.insert("1.0", row['Работа'])
         for c in sc.COLS[1:]:
@@ -1073,14 +1035,6 @@ class SmetaApp:
         Returns:
             str: название работы без единицы измерения.
         """
-        if not display_text:
-            return display_text
-        # Ищем последнее ' (' и извлекаем часть до него
-        idx = display_text.rfind(' (')
-        if idx >= 0:
-            return display_text[:idx].strip()
-        return display_text.strip()
-        """Извлекает чистое название работы из строки 'Название (ед.изм.)'."""
         if not display_text:
             return display_text
         # Ищем последнее ' (' и извлекаем часть до него
@@ -1646,8 +1600,10 @@ class SmetaApp:
         if col_idx not in (3, 5, 7, 9):
             return
         orig_name = str(self.edit_orig[1]).strip()
-        is_work_row = orig_name.startswith(sc.WORK_PREFIX)
-        is_mat_row = orig_name.startswith(sc.MATERIAL_PREFIX)
+        # ✅ Исправлено: используем is_work/is_material вместо прямой проверки префикса
+        # (strip() убирает пробелы из MATERIAL_PREFIX="    >", поэтому startswith не сработает)
+        is_work_row = sc.is_work(orig_name)
+        is_mat_row = sc.is_material(orig_name)
         if not (is_work_row or is_mat_row):
             return
         clean = sc.clean_name(orig_name)
@@ -1657,7 +1613,8 @@ class SmetaApp:
                 continue
             vals = list(self.tree_smeta.item(item, 'values'))
             v_name = str(vals[1]).strip()
-            same_type = ((is_work_row and v_name.startswith(sc.WORK_PREFIX)) or (is_mat_row and v_name.startswith(sc.MATERIAL_PREFIX)))
+            # ✅ Исправлено: используем is_work/is_material для проверки типа
+            same_type = (is_work_row and sc.is_work(v_name)) or (is_mat_row and sc.is_material(v_name))
             if not same_type:
                 continue
             if sc.clean_name(v_name) == clean:

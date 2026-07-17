@@ -7,8 +7,7 @@ db_manager.py
 import os
 import sqlite3
 import pandas as pd
-from typing import Optional, Dict, List, Tuple
-import time
+from typing import Optional, Dict
 
 # Нормализованная структура БД (колонки для DataFrame-представления)
 WORKS_COLS = ['id', 'name', 'unit', 'price_1', 'price_2']

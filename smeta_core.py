@@ -3,7 +3,6 @@
 smeta_core.py
 Бизнес-логика приложения "Сметчик PRO", не зависящая от tkinter.
 """
-import os
 import math
 import pandas as pd
 from xlsxwriter.utility import xl_rowcol_to_cell as RC
