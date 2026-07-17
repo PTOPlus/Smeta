@@ -3,4 +3,5 @@
 __pycache__/
 settings.json
 *.bak
-KODA.md
+*.md
+.vscode/
