@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Сметчик PRO 5.2
-Изменения: поддержка двух вариантов цены, сравнение экономии,
-учёт доп. расходов, корректный импорт/экспорт, фикс ручных правок,
-нормализованная база данных через SQLite.
+Сметчик PRO 5.2 — GUI-приложение для составления смет.
+
+Основной модуль приложения с графическим интерфейсом на tkinter.
+Включает управление базой данных, составление смет, импорт/экспорт.
+
+Классы:
+    SmetaApp — главное окно приложения с двумя вкладками:
+        • Составление сметы — создание и редактирование смет
+        • Справочник — управление базами работ и материалов
 """
 import os
 import re
@@ -29,6 +34,11 @@ DRAFT_FILE = 'smeta_draft.json'  # файл черновика сметы
 # Настройки
 # --------------------------------------------------------------------------
 def load_settings():
+    """Загружает настройки приложения из settings.json.
+    
+    Returns:
+        dict: Словарь с настройками. При отсутствии файла возвращаются значения по умолчанию.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_settings = {
         'db_folder': script_dir,
@@ -51,6 +61,11 @@ def load_settings():
     return default_settings
 
 def save_settings(settings):
+    """Сохраняет настройки в settings.json.
+    
+    Args:
+        settings (dict): Словарь настроек для сохранения.
+    """
     try:
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             json.dump(settings, f, indent=4, ensure_ascii=False)
@@ -61,6 +76,11 @@ def save_settings(settings):
 # Буфер обмена / контекстное меню
 # --------------------------------------------------------------------------
 def add_clipboard_support(widget):
+    """Добавляет поддержку Ctrl+C/V/X для виджета.
+    
+    Args:
+        widget: tkinter-виджет (Entry, Text и т.д.) для поддержки буфера обмена.
+    """
     def copy(event):
         try:
             text = event.widget.selection_get()
@@ -88,6 +108,10 @@ def add_clipboard_support(widget):
         return "break"
     
     def handle_ctrl_key(event):
+        """Обработчик нажатий Ctrl/Command для копирования/вставки/вырезания.
+        
+        Использует keycode вместо charcode для поддержки русской раскладки.
+        """
         # Определяем модификатор: Control (Windows/Linux) или Command (macOS)
         is_ctrl = (event.state & 0x4) != 0   # Control
         is_cmd = (event.state & 0x10) != 0   # Command (macOS)
@@ -103,17 +127,22 @@ def add_clipboard_support(widget):
             return cut(event)
         # Z (undo) обрабатывается отдельно в tree_smeta
         
-    # Привязываем ко всем нажатиям с Control/Command
-    widget.bind("<Control-Key>", handle_ctrl_key, add="+")
-    widget.bind("<Command-Key>", handle_ctrl_key, add="+")
-    
-    # Оставляем старые привязки как fallback (на случай нестандартных клавиатур)
-    widget.bind("<Control-c>", copy, add="+")
-    widget.bind("<Control-v>", paste, add="+")
-    widget.bind("<Command-c>", copy, add="+")
-    widget.bind("<Command-v>", paste, add="+")
+        # Привязываем ко всем нажатиям с Control/Command
+        widget.bind("<Control-Key>", handle_ctrl_key, add="+")
+        widget.bind("<Command-Key>", handle_ctrl_key, add="+")
+        
+        # Оставляем старые привязки как fallback (на случай нестандартных клавиатур)
+        widget.bind("<Control-c>", copy, add="+")
+        widget.bind("<Control-v>", paste, add="+")
+        widget.bind("<Command-c>", copy, add="+")
+        widget.bind("<Command-v>", paste, add="+")
 
 def add_context_menu(widget):
+    """Добавляет контекстное меню (ПКМ) с кнопками вырезать/копировать/вставить.
+    
+    Args:
+        widget: tkinter-виджет для привязки контекстного меню.
+    """
     menu = tk.Menu(widget, tearoff=0)
     def cut():
         try:
@@ -157,7 +186,23 @@ def add_context_menu(widget):
 # Главный класс приложения
 # --------------------------------------------------------------------------
 class SmetaApp:
+    """Главный класс приложения «Сметчик PRO».
+    
+    Управляет графическим интерфейсом, двумя вкладками (смета и справочник),
+    загрузкой/сохранением данных, импортом/экспортом смет.
+    
+    Атрибуты:
+        root: tkinter.Tk — главное окно приложения
+        db_manager: DatabaseManager — менеджер базы данных (SQLite)
+        db: pd.DataFrame — данные базы в плоском формате для отображения
+        settings: dict — настройки приложения
+    """
     def __init__(self, root):
+        """Инициализирует главное окно приложения.
+        
+        Args:
+            root: tkinter.Tk — корневой виджет окна.
+        """
         self.root = root
         self.root.title("Сметчик PRO 5.2")
         self.root.geometry("1650x900")
@@ -176,6 +221,7 @@ class SmetaApp:
         self.undo_stack = []
         self.ctx_menu_item = None
         self.ctx_menu_col = None
+        self.editing_work_id = None  # ID работы при редактировании
 
         # ✅ ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА БД
         if HAS_DB_MANAGER:
@@ -224,137 +270,85 @@ class SmetaApp:
         self.root.after(500, self._ask_load_draft)
 
     def show_about(self):
-        messagebox.showinfo("О программе", "Сметчик PRO 5.2\n\nПоддержка двух вариантов цены, учёт доп. расходов, автоматический расчёт экономии, нормализованная база данных.")
-
-    # --------------------------------------------------------------------------
-    # Черновик сметы
-    # --------------------------------------------------------------------------
-    def _get_draft_path(self):
-        """Возвращает путь к файлу черновика."""
-        return os.path.join(self.db_folder, DRAFT_FILE)
-
-    def _has_draft(self):
-        """Проверяет, существует ли черновик."""
-        return os.path.exists(self._get_draft_path())
-
-    def _save_draft(self):
-        """Сохраняет текущую смету как черновик."""
-        rows = self._gather_rows()
-        if not rows:
-            return
-        
-        # Удаляем черновик, если смета пуста
-        if len(rows) == 0:
-            draft_path = self._get_draft_path()
-            if os.path.exists(draft_path):
-                try:
-                    os.remove(draft_path)
-                except Exception:
-                    pass
-            return
-
-        draft_data = {
-            'title': self.title_entry.get().strip(),
-            'rows': [list(row) for row in rows],
-            'extra_entries': {
-                'overhead1': str(self.extra_entries['overhead1'].get()),
-                'overhead2': str(self.extra_entries['overhead2'].get()),
-                'lift1': str(self.extra_entries['lift1'].get()),
-                'lift2': str(self.extra_entries['lift2'].get()),
-                'trash1': str(self.extra_entries['trash1'].get()),
-                'trash2': str(self.extra_entries['trash2'].get()),
-            },
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        
-        try:
-            draft_path = self._get_draft_path()
-            with open(draft_path, 'w', encoding='utf-8') as f:
-                json.dump(draft_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Ошибка сохранения черновика: {e}")
-
-    def _load_draft(self):
-        """Загружает черновик сметы."""
-        if not self._has_draft():
-            return False
-
-        try:
-            draft_path = self._get_draft_path()
-            with open(draft_path, 'r', encoding='utf-8') as f:
-                draft_data = json.load(f)
-
-            # Очищаем текущую смету
-            self.tree_smeta.delete(*self.tree_smeta.get_children())
-
-            # Загружаем заголовок
-            self.title_entry.delete(0, tk.END)
-            if draft_data.get('title'):
-                self.title_entry.insert(0, draft_data['title'])
-
-            # Загружаем строки
-            for row in draft_data.get('rows', []):
-                vals = tuple(row)
-                tags = ("section",) if sc.is_section(str(vals[1])) else ()
-                self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
-
-            # Загружаем доп расходы
-            extra = draft_data.get('extra_entries', {})
-            for key in ('overhead1', 'overhead2', 'lift1', 'lift2', 'trash1', 'trash2'):
-                if key in self.extra_entries and key in extra:
-                    self.extra_entries[key].delete(0, tk.END)
-                    self.extra_entries[key].insert(0, str(extra[key]))
-
-            # Пересчитываем итоги
-            self.full_rebuild()
-
-            print(f"Черновик загружен: {draft_data.get('timestamp', 'unknown')}")
-            return True
-        except Exception as e:
-            print(f"Ошибка загрузки черновика: {e}")
-            return False
-
-    def _ask_load_draft(self):
-        """Предлагает загрузить черновик при старте."""
-        if not self._has_draft():
-            return
-
-        draft_path = self._get_draft_path()
-        try:
-            with open(draft_path, 'r', encoding='utf-8') as f:
-                draft_data = json.load(f)
-            timestamp = draft_data.get('timestamp', 'неизвестно')
-            row_count = len(draft_data.get('rows', []))
-        except Exception:
-            timestamp = 'неизвестно'
-            row_count = 0
-
-        result = messagebox.askyesno(
-            "Найден черновик сметы",
-            f"В предыдущей сессии была начата смета ({row_count} строк, сохранено: {timestamp}).\n\n"
-            f"Загрузить черновик и продолжить работу?"
+        """Открывает окно справки с описанием программы и её возможностей."""
+        about_text = (
+            "Сметчик PRO 5.2\n"
+            "Программа для составления смет с поддержкой двух вариантов цены\n\n"
+            "═" * 50 + "\n\n"
+            "📋 ОСНОВНЫЕ ВОЗМОЖНОСТИ\n\n"
+            "1. Составление сметы\n"
+            "   • Добавление работ из справочника с указанием объёма\n"
+            "   • Автоматический расчёт материалов по нормам расхода\n"
+            "   • Два варианта цены с автоматическим расчётом стоимости\n"
+            "   • Сравнение вариантов и расчёт экономии\n"
+            "   • Учёт доп. расходов: накладные, транспортные, подъёмные механизмы, вывоз мусора\n\n"
+            "2. Справочник работ и материалов\n"
+            "   • Хранение работ с ценами и единицами измерения\n"
+            "   • Привязка материалов к работам с нормами расхода\n"
+            "   • Два варианта цены для каждой позиции\n"
+            "   • Добавление, редактирование, удаление записей\n"
+            "   • Поиск и фильтрация по названию работы или материала\n"
+            "   • Сортировка по любому столбцу\n\n"
+            "3. Импорт и экспорт\n"
+            "   • Выгрузка сметы в Excel с формулами и форматированием\n"
+            "   • Автоматическое сохранение метаданных (Meta) для восстановления\n"
+            "   • Загрузка ранее экспортированных смет\n"
+            "   • Автоматическое добавление новых записей в справочник при импорте\n\n"
+            "4. Черновик сметы\n"
+            "   • Автосохранение при изменении сметы\n"
+            "   • Восстановление черновика при запуске программы\n"
+            "   • Ручное сохранение кнопкой «💾 Черновик»\n\n"
+            "═" * 50 + "\n\n"
+            "⌨️ ГОРЯЧИЕ КЛАВИШИ\n\n"
+            "   Ctrl+C / Ctrl+V / Ctrl+X — копировать / вставить / вырезать\n"
+            "   Ctrl+Z — отмена последнего изменения в смете\n"
+            "   ПКМ — контекстное меню (копировать/вставить)\n\n"
+            "═" * 50 + "\n\n"
+            "📊 ДВА ВАРИАНТА ЦЕНЫ\n\n"
+            "   Вариант 1 (В1) и Вариант 2 (В2) — независимые цены\n"
+            "   Автоматический расчёт В1 от В2 по коэффициенту\n"
+            "   Расчёт экономии между вариантами в процентах\n\n"
+            "═" * 50 + "\n\n"
+            "💾 ХРАНИЛИЩЕ ДАННЫХ\n\n"
+            "   • База данных: SQLite (.db) — нормализованная структура\n"
+            "   • Поддержка Excel (.xlsx) для совместимости\n"
+            "   • Автоматическая миграция из Excel в SQLite\n\n"
+            "═" * 50 + "\n\n"
+            "🔧 НАСТРОЙКИ\n\n"
+            "   • Папка для базы данных\n"
+            "   • Папка для сохранения смет\n"
+            "   • Коэффициент автоподстановки цены В1 от В2 для материалов\n"
+            "   • Коэффициент автоподстановки цены В1 от В2 для работ\n\n"
+            "═" * 50 + "\n\n"
+            "Версия: 5.2\n"
+            "Разработчик: Сметчик PRO\n"
+            "Поддержка: нормализованная база данных, два варианта цены\n"
         )
-
-        if result:
-            self._load_draft()
-            messagebox.showinfo("Готово", "Черновик сметы загружен.")
-        else:
-            # Пользователь отказался — удаляем черновик
-            try:
-                os.remove(draft_path)
-            except Exception:
-                pass
-
-    def _manual_save_draft(self):
-        """Явное сохранение черновика по кнопке."""
-        self._save_draft()
-        messagebox.showinfo("Готово", "Черновик сметы сохранён.\nОн будет автоматически загружен при следующем запуске программы.")
-
-    # --------------------------------------------------------------------------
-    # Настройки
-    # --------------------------------------------------------------------------
+        from tkinter import scrolledtext
+        win = tk.Toplevel(self.root)
+        win.title("Справка — О программе")
+        win.geometry("600x650")
+        win.resizable(True, True)
+        win.transient(self.root)
+        frame = tk.Frame(win, padx=15, pady=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+        text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, font=("Arial", 10), state="disabled")
+        text.pack(fill=tk.BOTH, expand=True)
+        text.config(state="normal")
+        text.insert("1.0", about_text)
+        text.config(state="disabled")
+        btn = tk.Frame(frame)
+        btn.pack(fill=tk.X, pady=(10, 0))
+        tk.Button(btn, text="Закрыть", bg="#4CAF50", fg="white", width=15,
+                  command=win.destroy).pack(side=tk.RIGHT, padx=5)
 
     def open_settings(self):
+        """Открывает окно настроек приложения.
+        
+        Позволяет изменить папку базы данных, папку экспорта и коэффициенты
+        автоподстановки цен.
+        """
+        settings_win = tk.Toplevel(self.root)
         settings_win = tk.Toplevel(self.root)
         settings_win.title("Настройки")
         settings_win.geometry("600x380")
@@ -395,11 +389,25 @@ class SmetaApp:
         tk.Button(btn_frame, text="Отмена", width=15, command=settings_win.destroy).pack(side=tk.LEFT, padx=10)
 
     def browse_folder(self, var):
+        """Открывает диалог выбора папки и записывает путь в StringVar.
+        
+        Args:
+            var: tk.StringVar — переменная для хранения пути.
+        """
         folder = filedialog.askdirectory(title="Выберите папку")
         if folder:
             var.set(folder)
 
     def save_settings_and_close(self, win, db_folder, export_folder, mat_ratio_str, work_ratio_str):
+        """Сохраняет настройки из окна настроек и перезагружает данные.
+        
+        Args:
+            win: tk.Toplevel — окно настроек для закрытия.
+            db_folder (str): путь к папке базы данных.
+            export_folder (str): путь к папке экспорта.
+            mat_ratio_str (str): коэффициент для материалов.
+            work_ratio_str (str): коэффициент для работ.
+        """
         os.makedirs(db_folder, exist_ok=True)
         os.makedirs(export_folder, exist_ok=True)
         try:
@@ -452,7 +460,7 @@ class SmetaApp:
         save_settings(self.settings)
 
     def apply_column_widths(self):
-        """Применяет сохранённые ширины колонок."""
+        """Применяет сохранённые ширины колонок из настроек."""
         db_widths = self.settings.get('db_col_widths', {})
         if hasattr(self, 'tree_db'):
             for col, width in db_widths.items():
@@ -476,6 +484,21 @@ class SmetaApp:
         self.root.destroy()
 
     def _load_db(self):
+        """Загружает базу данных (с поддержкой SQLite и Excel).
+        
+        Returns:
+            pd.DataFrame: данные базы в плоском формате (LEGACY_COLS).
+        """
+        if self.db_manager is not None:
+            return self.db_manager.get_legacy_dataframe()
+        else:
+            # Если это SQLite-база, а db_manager по какой-то причине не инициализирован
+            # — создаём его на лету
+            if (self.db_file and self.db_file.lower().endswith('.db')
+                    and HAS_DB_MANAGER):
+                db_name = os.path.splitext(os.path.basename(self.db_file))[0]
+                self.db_manager = DatabaseManager(self.db_folder, db_name)
+                return self.db_manager.get_legacy_dataframe()
         """Загружает базу данных (с поддержкой SQLite и Excel)."""
         if self.db_manager is not None:
             return self.db_manager.get_legacy_dataframe()
@@ -517,6 +540,7 @@ class SmetaApp:
             return migrated
 
     def setup_db_tab(self):
+        """Настраивает вкладку «Справочник»: поля ввода, кнопки, дерево базы данных."""
         db_sel_frame = tk.Frame(self.tab_db)
         db_sel_frame.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(db_sel_frame, text="📂 База данных:").pack(side=tk.LEFT)
@@ -579,9 +603,12 @@ class SmetaApp:
 
         btn_f = tk.Frame(self.tab_db)
         btn_f.pack(pady=5)
-        tk.Button(btn_f, text="Сохранить в базу", bg="#4CAF50", fg="white",
+        self.btn_edit = tk.Button(btn_f, text="✏️ Редактировать", bg="#FF9800", fg="white",
+                   command=self.edit_to_db, state="disabled")
+        self.btn_edit.pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_f, text="➕ Добавить запись", bg="#4CAF50", fg="white",
                   command=self.save_to_db).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_f, text="Удалить из базы", bg="#f44336", fg="white",
+        tk.Button(btn_f, text="🗑 Удалить из базы", bg="#f44336", fg="white",
                   command=self.delete_from_db).pack(side=tk.LEFT, padx=5)
 
         filter_frame = tk.Frame(self.tab_db)
@@ -611,17 +638,29 @@ class SmetaApp:
         self.refresh_db_table()
 
     def clear_db_filters(self):
+        """Очищает поля поиска и сбрасывает режим редактирования."""
         self.filter_work.delete(0, tk.END)
         self.filter_mat.delete(0, tk.END)
+        self.editing_work_id = None
+        self.btn_edit.config(state="disabled")
         self.refresh_db_table()
 
     def sort_column(self, col):
+        """Переключает сортировку таблицы базы данных по указанному столбцу.
+        
+        Args:
+            col (str): название столбца для сортировки.
+        """
         self.sort_orders[col] = not self.sort_orders[col]
         self.db = self.db.sort_values(by=col, ascending=self.sort_orders[col]).reset_index(drop=True)
         self.refresh_db_table()
 
     def save_to_db(self):
-        """Сохраняет запись в базу данных."""
+        """Добавляет новую запись в базу данных или обновляет существующую по имени.
+        
+        Проверяет, существует ли работа с таким названием. Если да — обновляет,
+        если нет — создаёт новую запись. Обрабатывает оба варианта (SQLite и Excel).
+        """
         try:
             data = {'Работа': self.work_text.get("1.0", tk.END).strip()}
             for c in ('Ед_изм_раб', 'Материал', 'Ед_изм'):
@@ -733,13 +772,128 @@ class SmetaApp:
             self.refresh_db_table()
             self.update_combobox()
             
-            msg = "Запись сохранена в базе."
+            msg = "Запись добавлена в базу."
             if no_materials:
                 msg += "\n(работа без материалов)"
             messagebox.showinfo("Готово", msg)
             self.refresh_estimate_if_needed(work_name)
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить:\n{e}")
+            messagebox.showerror("Ошибка", f"Не удалось добавить:\n{e}")
+
+    def edit_to_db(self):
+        """Редактирует выбранную запись в базе данных по ID.
+        
+        Обновляет данные работы и материалов. Если название работы изменено —
+        удаляет старую запись и создаёт новую.
+        """
+        if self.editing_work_id is None:
+            return messagebox.showwarning("Внимание", "Выберите запись для редактирования.")
+        
+        try:
+            work_name = self.work_text.get("1.0", tk.END).strip()
+            if not work_name:
+                return messagebox.showerror("Ошибка", "Введите наименование работы.")
+            
+            # ✅ Проверяем чекбокс "Без материалов"
+            no_materials = self.no_materials_var.get()
+            material_name = self.entries['Материал'].get().strip()
+            if no_materials or material_name in ("", "-", "0"):
+                material_name = "-"
+            
+            # Парсим данные материала
+            material_data = {}
+            if not no_materials and material_name != "-":
+                material_data = {
+                    'Ед_изм': self.entries['Ед_изм'].get().strip(),
+                    'Расход_1': float(self.entries['Расход_1'].get().replace(',', '.')) if self.entries['Расход_1'].get().strip() else 0.0,
+                    'Цена_мат_1': float(self.entries['Цена_мат_1'].get().replace(',', '.')) if self.entries['Цена_мат_1'].get().strip() else 0.0,
+                    'Расход_2': float(self.entries['Расход_2'].get().replace(',', '.')) if self.entries['Расход_2'].get().strip() else 0.0,
+                    'Цена_мат_2': float(self.entries['Цена_мат_2'].get().replace(',', '.')) if self.entries['Цена_мат_2'].get().strip() else 0.0,
+                }
+            
+            # Парсим цены работы
+            mat_ratio = self.settings.get('auto_price_mat_ratio', 1.35)
+            work_ratio = self.settings.get('auto_price_work_ratio', 2.2)
+            unit_w = self.entries['Ед_изм_раб'].get().strip()
+            price_w1 = float(self.entries['Цена_раб_1'].get().replace(',', '.')) if self.entries['Цена_раб_1'].get().strip() else 0.0
+            price_w2 = float(self.entries['Цена_раб_2'].get().replace(',', '.')) if self.entries['Цена_раб_2'].get().strip() else 0.0
+            
+            # ✅ Автоподстановка В1 от В2
+            if price_w2 > 0 and price_w1 == 0.0:
+                price_w1 = round(price_w2 * work_ratio, 2)
+                self.entries['Цена_раб_1'].delete(0, tk.END)
+                self.entries['Цена_раб_1'].insert(0, str(price_w1))
+            
+            if not no_materials and material_name != "-" and material_data:
+                if material_data['Цена_мат_2'] > 0 and material_data['Цена_мат_1'] == 0.0:
+                    material_data['Цена_мат_1'] = round(material_data['Цена_мат_2'] * mat_ratio, 2)
+                    self.entries['Цена_мат_1'].delete(0, tk.END)
+                    self.entries['Цена_мат_1'].insert(0, str(material_data['Цена_мат_1']))
+            
+            if self.db_manager is not None:
+                # Обновляем работу
+                self.db_manager.update_work(
+                    self.editing_work_id,
+                    unit=unit_w,
+                    price_1=price_w1,
+                    price_2=price_w2
+                )
+                
+                # Если изменилось название работы — удаляем старую и создаём новую
+                old_work = self.db_manager.get_work_by_name(work_name)
+                if old_work is None or int(old_work['id']) != self.editing_work_id:
+                    # Удаляем старую запись по ID
+                    self.db_manager.delete_work(self.editing_work_id)
+                    # Добавляем новую
+                    new_id = self.db_manager.add_work(
+                        work_name, unit_w, price_w1, price_w2
+                    )
+                    self.editing_work_id = new_id
+                    # Очищаем старые связи для новой работы
+                    self.db_manager.delete_work_material_links_by_work(new_id)
+                else:
+                    # Очищаем старые связи
+                    self.db_manager.delete_work_material_links_by_work(self.editing_work_id)
+                
+                # Обновляем/добавляем материал
+                if not no_materials and material_name != "-":
+                    mat = self.db_manager.get_material_by_name(material_name)
+                    if mat is None:
+                        mat_id = self.db_manager.add_material(
+                            material_name, material_data['Ед_изм'],
+                            material_data['Цена_мат_1'], material_data['Цена_мат_2']
+                        )
+                    else:
+                        mat_id = int(mat['id'])
+                        self.db_manager.update_material(
+                            mat_id,
+                            unit=material_data['Ед_изм'],
+                            price_1=material_data['Цена_мат_1'],
+                            price_2=material_data['Цена_мат_2']
+                        )
+                    self.db_manager.add_work_material_link(
+                        self.editing_work_id, mat_id,
+                        material_data['Расход_1'], material_data['Расход_2']
+                    )
+                
+                self.db_manager.flush()
+                self.db = self.db_manager.get_legacy_dataframe()
+            
+            if hasattr(self, 'filter_work'):
+                self.filter_work.delete(0, tk.END)
+            if hasattr(self, 'filter_mat'):
+                self.filter_mat.delete(0, tk.END)
+            
+            self.refresh_db_table()
+            self.update_combobox()
+            
+            msg = "Запись редактирована."
+            if no_materials:
+                msg += "\n(работа без материалов)"
+            messagebox.showinfo("Готово", msg)
+            self.refresh_estimate_if_needed(work_name)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось редактировать:\n{e}")
 
     def refresh_estimate_if_needed(self, work_name):
         rows = self._gather_rows()
@@ -769,6 +923,7 @@ class SmetaApp:
         self.full_rebuild()
 
     def delete_from_db(self):
+        """Удаляет выбранную запись из базы данных."""
         sel = self.tree_db.selection()
         if not sel:
             return messagebox.showwarning("Внимание", "Выберите строку для удаления.")
@@ -798,10 +953,12 @@ class SmetaApp:
             self.refresh_db_table()
             self.update_combobox()
             messagebox.showinfo("Готово", f"Запись «{work_name}» удалена.")
+            self.editing_work_id = None  # Сбрасываем после удаления
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось удалить запись:\n{e}")
 
     def refresh_db_table(self):
+        """Обновляет отображение таблицы базы данных с учётом фильтров."""
         if not hasattr(self, 'tree_db'):
             return
         self.tree_db.delete(*self.tree_db.get_children())
@@ -815,15 +972,66 @@ class SmetaApp:
         for idx, r in df.iterrows():
             vals = [r[c] for c in self.display_cols]
             self.tree_db.insert("", tk.END, iid=str(idx), values=vals)
+        # Сбрасываем режим редактирования при обновлении таблицы
+        self.editing_work_id = None
+        if hasattr(self, 'btn_edit'):
+            self.btn_edit.config(state="disabled")
 
     def load_to_entries(self, event):
+        """Загружает данные выбранной строки в поля ввода редактора.
+        
+        Args:
+            event: событие выбора строки в Treeview.
+        """
         sel = self.tree_db.selection()
         if not sel:
+            self.editing_work_id = None
+            self.btn_edit.config(state="disabled")
             return
         try:
             idx = int(sel[0])
             row = self.db.loc[idx]
+            work_name = str(row['Работа']).strip()
+            # Находим ID работы в db_manager
+            if self.db_manager is not None:
+                work = self.db_manager.get_work_by_name(work_name)
+                if work is not None:
+                    self.editing_work_id = int(work['id'])
+                    self.btn_edit.config(state="normal")
+                else:
+                    self.editing_work_id = None
+                    self.btn_edit.config(state="disabled")
+            else:
+                self.editing_work_id = None
+                self.btn_edit.config(state="disabled")
         except (KeyError, ValueError):
+            self.editing_work_id = None
+            self.btn_edit.config(state="disabled")
+            return
+        sel = self.tree_db.selection()
+        if not sel:
+            self.editing_work_id = None
+            self.btn_edit.config(state="disabled")
+            return
+        try:
+            idx = int(sel[0])
+            row = self.db.loc[idx]
+            work_name = str(row['Работа']).strip()
+            # Находим ID работы в db_manager
+            if self.db_manager is not None:
+                work = self.db_manager.get_work_by_name(work_name)
+                if work is not None:
+                    self.editing_work_id = int(work['id'])
+                    self.btn_edit.config(state="normal")
+                else:
+                    self.editing_work_id = None
+                    self.btn_edit.config(state="disabled")
+            else:
+                self.editing_work_id = None
+                self.btn_edit.config(state="disabled")
+        except (KeyError, ValueError):
+            self.editing_work_id = None
+            self.btn_edit.config(state="disabled")
             return
         self.work_text.delete("1.0", tk.END)
         self.work_text.insert("1.0", row['Работа'])
@@ -835,8 +1043,10 @@ class SmetaApp:
         self.no_materials_var.set(mat_val in ("", "-", "0"))
 
     def update_combobox(self):
+        """Обновляет выпадающий список работ в калькуляторе сметы."""
         if not hasattr(self, 'work_combo'):
             return
+        self.editing_work_id = None  # Сбрасываем при обновлении
         if not self.db.empty:
             # Создаём словарь: название -> ед.изм
             self.work_units = {}
@@ -855,6 +1065,21 @@ class SmetaApp:
             self.work_units = {}
 
     def _extract_work_name(self, display_text):
+        """Извлекает чистое название работы из строки 'Название (ед.изм.)'.
+        
+        Args:
+            display_text (str): текст из выпадающего списка.
+            
+        Returns:
+            str: название работы без единицы измерения.
+        """
+        if not display_text:
+            return display_text
+        # Ищем последнее ' (' и извлекаем часть до него
+        idx = display_text.rfind(' (')
+        if idx >= 0:
+            return display_text[:idx].strip()
+        return display_text.strip()
         """Извлекает чистое название работы из строки 'Название (ед.изм.)'."""
         if not display_text:
             return display_text
@@ -879,6 +1104,7 @@ class SmetaApp:
         self.work_combo.icursor(tk.END)
 
     def refresh_db_list(self):
+        """Обновляет список доступных баз данных в выпадающем списке."""
         if not os.path.exists(self.db_folder):
             os.makedirs(self.db_folder, exist_ok=True)
         files = os.listdir(self.db_folder)
@@ -904,6 +1130,11 @@ class SmetaApp:
             self.on_db_selected()
 
     def on_db_selected(self, event=None):
+        """Вызывается при выборе базы данных из выпадающего списка.
+        
+        Args:
+            event: событие выбора из Combobox (необязательный аргумент).
+        """
         new_db = self.db_combo.get()
         if new_db and new_db != self.active_db_filename:
             self.active_db_filename = new_db
@@ -925,11 +1156,98 @@ class SmetaApp:
             self.update_combobox()
 
     def _save_active_db_to_settings(self):
+        """Сохраняет имя активной базы данных в настройки."""
         settings = load_settings()
         settings['active_db_filename'] = self.active_db_filename
         save_settings(settings)
 
+    # --------------------------------------------------------------------------
+    # Черновик сметы
+    # --------------------------------------------------------------------------
+    def _get_draft_path(self):
+        """Возвращает путь к файлу черновика сметы.
+        
+        Returns:
+            str: полный путь к файлу smeta_draft.json в папке базы данных.
+        """
+        return os.path.join(self.db_folder, DRAFT_FILE)
+
+    def _has_draft(self):
+        """Проверяет, существует ли черновик сметы.
+        
+        Returns:
+            bool: True если черновик существует.
+        """
+        return os.path.exists(self._get_draft_path())
+
+    def _save_draft(self):
+        """Сохраняет текущее состояние сметы в файл черновика.
+        
+        Сохраняет:
+        - Название сметы.
+        - Все строки сметы (включая разделы и работы).
+        - Дополнительные расходы (накладные, подъёмные, вывоз мусора).
+        """
+        try:
+            draft_data = {
+                'title': self.title_entry.get(),
+                'rows': self._gather_rows(),
+                'extra': {key: val.get() for key, val in self.extra_entries.items()}
+            }
+            os.makedirs(self.db_folder, exist_ok=True)
+            with open(self._get_draft_path(), 'w', encoding='utf-8') as f:
+                json.dump(draft_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # Тихо игнорируем ошибки сохранения
+
+    def _load_draft(self, draft_data):
+        """Загружает данные черновика в смету.
+        
+        Args:
+            draft_data (dict): данные черновика из JSON.
+        """
+        if draft_data.get('title'):
+            self.title_entry.delete(0, tk.END)
+            self.title_entry.insert(0, draft_data['title'])
+        self.tree_smeta.delete(*self.tree_smeta.get_children())
+        for vals in draft_data.get('rows', []):
+            tags = ("section",) if sc.is_section(str(vals[1])) else ()
+            self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
+        extra = draft_data.get('extra', {})
+        for key, val in extra.items():
+            if key in self.extra_entries:
+                self.extra_entries[key].delete(0, tk.END)
+                self.extra_entries[key].insert(0, str(val))
+        self.full_rebuild()
+
+    def _ask_load_draft(self):
+        """Предлагает загрузить черновик при запуске программы.
+        
+        Если существует сохранённый черновик, показывает диалог с вопросом
+        о его восстановлении.
+        """
+        if not self._has_draft():
+            return
+        if not messagebox.askyesno("Восстановление", "Обнаружен несохранённый черновик сметы.\nВосстановить его при запуске?"):
+            return
+        try:
+            with open(self._get_draft_path(), 'r', encoding='utf-8') as f:
+                draft_data = json.load(f)
+            self._load_draft(draft_data)
+            messagebox.showinfo("Готово", "Черновик сметы восстановлен.")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось загрузить черновик:\n{e}")
+
+    def _manual_save_draft(self):
+        """Сохраняет черновик сметы и показывает сообщение об успехе."""
+        self._save_draft()
+        messagebox.showinfo("Готово", "Черновик сметы сохранён.\nОн будет автоматически загружен при следующем запуске программы.")
+
     def create_new_db(self):
+        """Создаёт новую пустую базу данных (SQLite).
+        
+        Открывает диалог ввода имени файла, создаёт .db базу и загружает её.
+        """
         new_name = simpledialog.askstring("Новая база", "Введите имя файла (например, База_Кровля.db):")
         if not new_name:
             return
@@ -952,6 +1270,7 @@ class SmetaApp:
         messagebox.showinfo("Готово", f"База «{display_name}» создана и загружена.")
 
     def delete_current_db(self):
+        """Удаляет текущую базу данных с подтверждением пользователя."""
         if not self.active_db_filename:
             return
         if not messagebox.askyesno("Подтверждение", f"Удалить базу «{self.active_db_filename}»?\nЭто действие нельзя отменить."):
@@ -974,6 +1293,7 @@ class SmetaApp:
             messagebox.showerror("Ошибка", f"Не удалось удалить файл:\n{e}")
 
     def setup_calc_tab(self):
+        """Настраивает вкладку «Составление сметы»: поля, кнопки, дерево сметы."""
         frame_title = tk.Frame(self.tab_calc, pady=4)
         frame_title.pack(fill=tk.X, padx=10)
         tk.Label(frame_title, text="Наименование сметы / объект:").pack(side=tk.LEFT)
@@ -1077,9 +1397,19 @@ class SmetaApp:
         self.total_label.pack(side=tk.RIGHT)
 
     def _gather_rows(self):
+        """Собирает все строки из дерева сметы в список кортежей.
+        
+        Returns:
+            list: список значений строк (кортежи).
+        """
         return [self.tree_smeta.item(it, 'values') for it in self.tree_smeta.get_children()]
 
     def full_rebuild(self):
+        """Полностью пересчитывает смету: пересчёт объёмов, стоимостей, итогов.
+        
+        Пересоздаёт все строки на основе текущих данных с учётом норм расхода
+        и объёмов работ.
+        """
         rows = self._gather_rows()
         rebuilt = sc.rebuild_smeta(rows)
         self.tree_smeta.delete(*self.tree_smeta.get_children())
@@ -1090,9 +1420,18 @@ class SmetaApp:
         self._save_draft()  # автосохранение черновика
 
     def add_section(self):
+        """Добавляет новый раздел в смету."""
         self.tree_smeta.insert("", tk.END, values=("", f"{sc.SECTION_PREFIX}Новый раздел", "", "", "", "", "", "", "", "", ""), tags=("section",))
 
     def _editable_cols_for(self, name_raw):
+        """Возвращает индексы редактируемых колонок для строки.
+        
+        Args:
+            name_raw (str): текст названия строки (с префиксом или без).
+            
+        Returns:
+            set: множество индексов колонок, которые можно редактировать.
+        """
         name_raw = str(name_raw).strip()
         if sc.is_work(name_raw):
             return {1, 4, 5, 9}
@@ -1101,6 +1440,11 @@ class SmetaApp:
         return set()
 
     def on_tree_double_click(self, event):
+        """Обработчик двойного клика по строке сметы — начинает редактирование ячейки.
+        
+        Args:
+            event: событие мыши с координатами клика.
+        """
         item = self.tree_smeta.identify_row(event.y)
         if not item:
             return
@@ -1119,6 +1463,7 @@ class SmetaApp:
             self._start_cell_edit(item, vals, col_idx)
 
     def add_to_estimate(self):
+        """Добавляет выбранную работу в смету с указанным объёмом."""
         display_text = self.work_combo.get().strip()
         if not display_text:
             return messagebox.showwarning("Внимание", "Выберите работу из списка.")
@@ -1132,6 +1477,13 @@ class SmetaApp:
         self._add_work_to_smeta(work_name, vol)
 
     def _add_work_to_smeta(self, work_name, volume, suppress_total_update=False):
+        """Добавляет блок работы с материалами в смету.
+        
+        Args:
+            work_name (str): название работы из справочника.
+            volume (float): объём работы.
+            suppress_total_update (bool): если True, не обновляет итоги (для пакетного добавления).
+        """
         rows = self._gather_rows()
         next_num = 1
         for vals in rows:
@@ -1147,6 +1499,7 @@ class SmetaApp:
         self._save_draft()  # автосохранение черновика
 
     def remove_smeta_row(self):
+        """Удаляет выбранные строки из сметы и пересчитывает итоги."""
         selected = self.tree_smeta.selection()
         if not selected:
             return
@@ -1160,6 +1513,7 @@ class SmetaApp:
         self._save_draft()  # автосохранение черновика
 
     def update_total_sum(self):
+        """Пересчитывает и обновляет итоговую сумму сметы на экране."""
         rows = self._gather_rows()
         t1, t2 = sc.compute_grand_totals(rows)
         oh1 = sc.to_float(self.extra_entries['overhead1'].get())
@@ -1181,6 +1535,12 @@ class SmetaApp:
         self.root.update_idletasks()
 
     def _edit_section_inline(self, item, vals):
+        """Начинает редактирование названия раздела прямо в дереве.
+        
+        Args:
+            item: идентификатор строки в Treeview.
+            vals: значения строки.
+        """
         bbox = self.tree_smeta.bbox(item, column='#2')
         if not bbox:
             return
@@ -1200,6 +1560,7 @@ class SmetaApp:
         self.edit_entry.bind("<FocusOut>", lambda e: self.root.after(100, self._save_section_edit))
 
     def _save_section_edit(self):
+        """Завершает редактирование названия раздела и обновляет дерево."""
         if self.edit_entry is None or not self.edit_entry.winfo_exists():
             return
         nm = self.edit_entry.get().strip()
@@ -1210,6 +1571,13 @@ class SmetaApp:
         self._destroy_edit()
 
     def _start_cell_edit(self, item, vals, col_idx):
+        """Начинает редактирование ячейки в дереве сметы.
+        
+        Args:
+            item: идентификатор строки в Treeview.
+            vals: значения строки.
+            col_idx (int): индекс редактируемой колонки.
+        """
         self.undo_stack.append((item, col_idx, vals[col_idx]))
         ct = f'#{col_idx + 1}'
         bbox = self.tree_smeta.bbox(item, column=ct)
@@ -1231,6 +1599,7 @@ class SmetaApp:
         self.edit_entry.bind("<FocusOut>", lambda e: self.root.after(100, self._finish_cell_edit))
 
     def _finish_cell_edit(self):
+        """Завершает редактирование ячейки и применяет изменения."""
         if self.edit_entry is None or not self.edit_entry.winfo_exists():
             return
         nv = self.edit_entry.get().strip()
@@ -1265,6 +1634,15 @@ class SmetaApp:
             self._destroy_edit()
 
     def _propagate_same_name(self, nvals, col_idx):
+        """Применяет изменение ко всем строкам с таким же названием работы/материала.
+        
+        При изменении цены или нормы для работы/материала, все другие строки
+        с таким же именем получают это же значение.
+        
+        Args:
+            nvals: обновлённые значения строки.
+            col_idx (int): индекс изменённой колонки.
+        """
         if col_idx not in (3, 5, 7, 9):
             return
         orig_name = str(self.edit_orig[1]).strip()
@@ -1287,6 +1665,15 @@ class SmetaApp:
                 self.tree_smeta.item(item, values=tuple(vals))
 
     def _sync_db(self, nv, col_idx):
+        """Синхронизирует изменения в смете с базой данных.
+        
+        При изменении цены или нормы в смете, обновляет соответствующие
+        записи в SQLite-базе.
+        
+        Args:
+            nv: новые значения строки.
+            col_idx (int): индекс изменённой колонки.
+        """
         ov = str(self.edit_orig[1]).strip()
         is_work_row = ov.startswith(sc.WORK_PREFIX)
         is_mat_row = ov.startswith(sc.MATERIAL_PREFIX)
@@ -1321,6 +1708,7 @@ class SmetaApp:
             messagebox.showerror("Ошибка БД", str(e))
 
     def _destroy_edit(self):
+        """Уничтожает поле редактирования и сбрасывает переменные состояния."""
         if self.edit_entry is not None and self.edit_entry.winfo_exists():
             self.edit_entry.destroy()
         self.edit_entry = None
@@ -1329,6 +1717,14 @@ class SmetaApp:
         self.edit_orig = None
 
     def _show_name_tooltip(self, event):
+        """Показывает всплывающую подсказку с полным названием строки.
+        
+        Если название строки длиннее 45 символов, показывает полное значение
+        во всплывающем окне при наведении курсора.
+        
+        Args:
+            event: событие движения мыши.
+        """
         item = self.tree_smeta.identify_row(event.y)
         col = self.tree_smeta.identify_column(event.x)
         if not item or col != '#2':
@@ -1360,6 +1756,7 @@ class SmetaApp:
         ).pack()
 
     def _hide_tooltip(self, event=None):
+        """Скрывает всплывающую подсказку."""
         if hasattr(self, '_tooltip_win') and self._tooltip_win is not None:
             try:
                 self._tooltip_win.destroy()
@@ -1369,6 +1766,14 @@ class SmetaApp:
                 self._tooltip_win = None
 
     def _open_material_dialog(self, initial_data=None):
+        """Открывает диалог для добавления нового материала.
+        
+        Args:
+            initial_data (dict, optional): начальные данные для предзаполнения полей.
+            
+        Returns:
+            dict or None: словарь с данными материала или None при отмене.
+        """
         win = tk.Toplevel(self.root)
         win.title("Добавить материал")
         win.resizable(False, False)
@@ -1418,6 +1823,7 @@ class SmetaApp:
         return result if result else None
 
     def add_material_to_selected(self):
+        """Добавляет новый материал в смету после выбранной строки."""
         sel = self.tree_smeta.selection()
         if not sel:
             return messagebox.showwarning("Внимание", "Выберите работу или материал.")
@@ -1437,6 +1843,7 @@ class SmetaApp:
         self.full_rebuild()
 
     def duplicate_material(self):
+        """Дублирует выбранную строку материала."""
         sel = self.tree_smeta.selection()
         if not sel:
             return messagebox.showwarning("Внимание", "Выберите строку материала.")
@@ -1451,6 +1858,11 @@ class SmetaApp:
         self.full_rebuild()
 
     def load_estimate(self):
+        """Загружает смету из Excel-файла.
+        
+        Читает лист «Смета» (данные) и «Meta» (метаданные). Предлагает
+        добавить новые записи из Meta в справочник.
+        """
         file_path = filedialog.askopenfilename(title="Выберите файл сметы", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         if not file_path:
             return
@@ -1499,6 +1911,14 @@ class SmetaApp:
         messagebox.showinfo("Готово", "Смета загружена.")
 
     def _reconcile_meta(self, meta_df):
+        """Сравнивает метаданные из сметы с текущим справочником.
+        
+        Ищет записи, которые есть в Meta, но отсутствуют в базе, или
+        имеют другие значения. Предлагает добавить их в справочник.
+        
+        Args:
+            meta_df (pd.DataFrame): DataFrame с метаданными из файла сметы.
+        """
         for col in sc.COLS:
             if col not in meta_df.columns:
                 meta_df[col] = "-" if col in ('Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм') else 0.0
@@ -1544,6 +1964,12 @@ class SmetaApp:
             messagebox.showinfo("Информация", "Все записи из сметы уже присутствуют в справочнике.")
 
     def export_excel(self):
+        """Выгружает текущую смету в Excel-файл с формулами и форматированием.
+        
+        Создаёт файл с двумя листами: «Смета» (данные) и «Meta» (метаданные
+        для восстановления). Включает накладные расходы, подъёмные механизмы,
+        вывоз мусора.
+        """
         rows = self._gather_rows()
         if not rows:
             return messagebox.showwarning("Внимание", "Смета пуста — нечего выгружать.")
@@ -1593,6 +2019,7 @@ class SmetaApp:
             messagebox.showerror("Ошибка", f"Не удалось создать файл.\nЗакройте Excel и попробуйте снова.\n\n{e}")
 
     def undo_action(self, event=None):
+        """Выполняет отмену последнего изменения в смете (Ctrl+Z)."""
         if self.undo_stack:
             item_id, col_idx, old_val = self.undo_stack.pop()
             if self.tree_smeta.exists(item_id):
@@ -1602,6 +2029,7 @@ class SmetaApp:
                 self.full_rebuild()
 
     def _show_context_menu(self, event):
+        """Показывает контекстное меню для ячейки сметы (ПКМ)."""
         self.ctx_menu_item = self.tree_smeta.identify_row(event.y)
         self.ctx_menu_col = self.tree_smeta.identify_column(event.x)
         if not self.ctx_menu_item or not self.ctx_menu_col:
@@ -1612,6 +2040,7 @@ class SmetaApp:
         menu.tk_popup(event.x_root, event.y_root)
 
     def _copy_cell(self):
+        """Копирует значение ячейки в буфер обмена."""
         if self.ctx_menu_item:
             col_idx = int(self.ctx_menu_col[1:]) - 1
             val = self.tree_smeta.item(self.ctx_menu_item, 'values')[col_idx]
@@ -1619,6 +2048,7 @@ class SmetaApp:
             self.root.clipboard_append(str(val))
 
     def _paste_cell(self):
+        """Вставляет значение из буфера обмена в ячейку."""
         if not self.ctx_menu_item:
             return
         try:
