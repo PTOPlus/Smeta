@@ -1,5 +1,8 @@
 *.xlsx
-*.parquet
+*.db
+*.db-shm
+*.db-wal
+*.md
 __pycache__/
 *.json
 *.bak
