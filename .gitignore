@@ -1,6 +1,8 @@
 *.xlsx
 *.parquet
 __pycache__/
-settings.json
+*.json
 *.bak
-KODA.md
+*.md
+*.db
+.vscode/
