@@ -4,5 +4,6 @@
 *.db-wal
 *.md
 __pycache__/
+.vscode/
 *.json
 *.bak
