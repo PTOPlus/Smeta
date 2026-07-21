@@ -717,8 +717,13 @@ class SmetaApp:
                         price_1=data['Цена_раб_1'], price_2=data['Цена_раб_2']
                     )
 
-                # ✅ Очищаем старые связи перед добавлением новых
-                self.db_manager.delete_work_material_links_by_work(work_id)
+                # ✅ Очищаем старые связи только для НОВЫХ работ (у которых нет материалов)
+                # Для существующих работ с материалами — просто добавляем новый материал
+                existing_links = self.db_manager.work_materials_cache[
+                    self.db_manager.work_materials_cache['work_id'] == work_id
+                ]
+                if existing_links.empty:
+                    self.db_manager.delete_work_material_links_by_work(work_id)
 
                 mat_name = data['Материал']
                 if mat_name != "-":
