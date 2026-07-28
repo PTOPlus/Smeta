@@ -1,2034 +1,1564 @@
 # -*- coding: utf-8 -*-
 """
-Сметчик PRO 5.2 — GUI-приложение для составления смет.
-
-Основной модуль приложения с графическим интерфейсом на tkinter.
-Включает управление базой данных, составление смет, импорт/экспорт.
-
-Классы:
-    SmetaApp — главное окно приложения с двумя вкладками:
-        • Составление сметы — создание и редактирование смет
-        • Справочник — управление базами работ и материалов
+app.py — Главный модуль приложения «Сметчик PRO 5.3» (PyQt6).
+Графический интерфейс: два таба — «Составление сметы» и «Справочник».
+Управление базами, черновик, настройки, экспорт/импорт.
 """
 import os
-import re
+import sys
 import json
+import math
 from datetime import datetime
-import pandas as pd
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
-import smeta_core as sc
 
-# ✅ ИМПОРТ МЕНЕДЖЕРА БАЗЫ ДАННЫХ
-try:
-    from db_manager import DatabaseManager
-    HAS_DB_MANAGER = True
-except ImportError:
-    HAS_DB_MANAGER = False
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox, QMessageBox, QFileDialog, QDialog,
+    QFormLayout, QGroupBox, QHeaderView, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QSplitter, QMenuBar, QMenu, QStatusBar, QFrame,
+    QAbstractItemView, QInputDialog, QDialogButtonBox,
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QDate
+from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut, QColor
 
-SETTINGS_FILE = 'settings.json'
-DRAFT_FILE = 'smeta_draft.json'  # файл черновика сметы
+from smeta_core import (
+    build_work_block, rebuild_smeta, compute_grand_totals,
+    export_smeta_to_excel, parse_exported_sheet,
+    to_float, is_section, is_work, is_total, is_material, clean_name,
+    SECTION_PREFIX, WORK_PREFIX, MATERIAL_PREFIX, TOTAL_PREFIX,
+    CALC_HEADERS, COLS,
+)
+from db_manager import DatabaseManager
 
-# --------------------------------------------------------------------------
-# Настройки
-# --------------------------------------------------------------------------
-def load_settings():
-    """Загружает настройки приложения из settings.json.
-    
-    Returns:
-        dict: Словарь с настройками. При отсутствии файла возвращаются значения по умолчанию.
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_settings = {
-        'db_folder': script_dir,
-        'export_folder': script_dir,
-        'active_db_filename': 'my_works_base.xlsx',
-        'auto_price_mat_ratio': 1.35,
-        'auto_price_work_ratio': 2.2,
-        'db_col_widths': {},
-        'calc_col_widths': {},
-    }
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                settings = json.load(f)
-            for key in default_settings:
-                settings.setdefault(key, default_settings[key])
-            return settings
-        except Exception as e:
-            print(f"Ошибка загрузки настроек: {e}")
-    return default_settings
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+DRAFT_FILE = "smeta_draft.json"
+WINDOW_SIZE = (1400, 900)
+FONT_FAMILY = "Segoe UI"
+FONT_SIZE = 10
+TABLE_ROW_HEIGHT = 28
 
-def save_settings(settings):
-    """Сохраняет настройки в settings.json.
-    
-    Args:
-        settings (dict): Словарь настроек для сохранения.
-    """
-    try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"Ошибка сохранения настроек: {e}")
+# Индексы колонок
+COL_NUM = 0
+COL_NAME = 1
+COL_UNIT = 2
+COL_NORM1 = 3
+COL_VOL1 = 4
+COL_PRICE1 = 5
+COL_COST1 = 6
+COL_NORM2 = 7
+COL_VOL2 = 8
+COL_PRICE2 = 9
+COL_COST2 = 10
 
-# --------------------------------------------------------------------------
-# Буфер обмена / контекстное меню
-# --------------------------------------------------------------------------
-def add_clipboard_support(widget):
-    """Добавляет поддержку Ctrl+C/V/X для виджета.
-    
-    Args:
-        widget: tkinter-виджет (Entry, Text и т.д.) для поддержки буфера обмена.
-    """
-    def copy(event):
-        try:
-            text = event.widget.selection_get()
-            event.widget.clipboard_clear()
-            event.widget.clipboard_append(text)
-        except tk.TclError:
-            pass
-        return "break"
-    
-    def paste(event):
-        try:
-            event.widget.insert(tk.INSERT, event.widget.clipboard_get())
-        except tk.TclError:
-            pass
-        return "break"
-    
-    def cut(event=None):
-        try:
-            text = event.widget.selection_get()
-            event.widget.clipboard_clear()
-            event.widget.clipboard_append(text)
-            event.widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
-        except tk.TclError:
-            pass
-        return "break"
-    
-    def handle_ctrl_key(event):
-        """Обработчик нажатий Ctrl/Command для копирования/вставки/вырезания.
-        
-        Использует keycode вместо charcode для поддержки русской раскладки.
-        """
-        # Определяем модификатор: Control (Windows/Linux) или Command (macOS)
-        is_ctrl = (event.state & 0x4) != 0   # Control
-        is_cmd = (event.state & 0x10) != 0   # Command (macOS)
-        if not (is_ctrl or is_cmd):
-            return
-        
-        # Keycode не зависит от раскладки!
-        if event.keycode == 67:   # C
-            return copy(event)
-        elif event.keycode == 86: # V
-            return paste(event)
-        elif event.keycode == 88: # X
-            return cut(event)
-        # Z (undo) обрабатывается отдельно в tree_smeta
-        
-        # Привязываем ко всем нажатиям с Control/Command
-        widget.bind("<Control-Key>", handle_ctrl_key, add="+")
-        widget.bind("<Command-Key>", handle_ctrl_key, add="+")
-        
-        # Оставляем старые привязки как fallback (на случай нестандартных клавиатур)
-        widget.bind("<Control-c>", copy, add="+")
-        widget.bind("<Control-v>", paste, add="+")
-        widget.bind("<Command-c>", copy, add="+")
-        widget.bind("<Command-v>", paste, add="+")
+EDITABLE_WORK = {COL_NORM1, COL_VOL1, COL_PRICE1, COL_NORM2, COL_VOL2, COL_PRICE2}
+EDITABLE_MAT = {COL_NORM1, COL_PRICE1, COL_NORM2, COL_PRICE2}
 
-def add_context_menu(widget):
-    """Добавляет контекстное меню (ПКМ) с кнопками вырезать/копировать/вставить.
-    
-    Args:
-        widget: tkinter-виджет для привязки контекстного меню.
-    """
-    menu = tk.Menu(widget, tearoff=0)
-    def cut():
-        try:
-            text = widget.selection_get()
-            widget.clipboard_clear()
-            widget.clipboard_append(text)
-            widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
-        except tk.TclError:
-            pass
-    def copy():
-        try:
-            text = widget.selection_get()
-            widget.clipboard_clear()
-            widget.clipboard_append(text)
-        except tk.TclError:
-            pass
-    def paste():
-        try:
-            widget.insert(tk.INSERT, widget.clipboard_get())
-        except tk.TclError:
-            pass
-    menu.add_command(label="Вырезать", command=cut)
-    menu.add_command(label="Копировать", command=copy)
-    menu.add_command(label="Вставить", command=paste)
-    def show_menu(event):
-        try:
-            has_selection = widget.tag_ranges(tk.SEL)
-        except Exception:
-            has_selection = False
-        menu.entryconfigure(0, state="normal" if has_selection else "disabled")
-        menu.entryconfigure(1, state="normal" if has_selection else "disabled")
-        try:
-            widget.clipboard_get()
-            menu.entryconfigure(2, state="normal")
-        except tk.TclError:
-            menu.entryconfigure(2, state="disabled")
-        menu.tk_popup(event.x_root, event.y_root)
-    widget.bind("<Button-3>", show_menu)
 
-# --------------------------------------------------------------------------
-# Главный класс приложения
-# --------------------------------------------------------------------------
-class SmetaApp:
-    """Главный класс приложения «Сметчик PRO».
-    
-    Управляет графическим интерфейсом, двумя вкладками (смета и справочник),
-    загрузкой/сохранением данных, импортом/экспортом смет.
-    
-    Атрибуты:
-        root: tkinter.Tk — главное окно приложения
-        db_manager: DatabaseManager — менеджер базы данных (SQLite)
-        db: pd.DataFrame — данные базы в плоском формате для отображения
-        settings: dict — настройки приложения
-    """
-    def __init__(self, root):
-        """Инициализирует главное окно приложения.
-        
-        Args:
-            root: tkinter.Tk — корневой виджет окна.
-        """
-        self.root = root
-        self.root.title("Сметчик PRO 5.2")
-        self.root.geometry("1650x900")
-        
-        settings = load_settings()
-        self.settings = settings
-        self.db_folder = settings['db_folder']
-        self.export_folder = settings['export_folder']
-        self.active_db_filename = settings.get('active_db_filename', 'my_works_base.xlsx')
-        self.db_file = os.path.join(self.db_folder, self.active_db_filename)
+def _cell(value, right_align=False):
+    """Создаёт QTableWidgetItem."""
+    item = QTableWidgetItem(str(value) if value is not None else "")
+    if right_align:
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    return item
 
-        self.edit_entry = None
-        self.edit_item = None
-        self.edit_col_idx = None
-        self.edit_orig = None
-        self.undo_stack = []
-        self.ctx_menu_item = None
-        self.ctx_menu_col = None
-        self.editing_work_id = None  # ID работы при редактировании
 
-        # ✅ ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА БД
-        if HAS_DB_MANAGER:
-            if self.active_db_filename.lower().endswith('.db'):
-                db_name = self.active_db_filename.rsplit('.', 1)[0]
-                self.db_manager = DatabaseManager(self.db_folder, db_name)
-            elif self.active_db_filename.lower().endswith('.xlsx'):
-                # Excel база — без db_manager
-                self.db_manager = None
-            else:
-                # По умолчанию — SQLite
-                db_name = self.active_db_filename.rsplit('.', 1)[0]
-                self.db_manager = DatabaseManager(self.db_folder, db_name)
-        else:
-            self.db_manager = None
+# ---------------------------------------------------------------------------
+# Диалог создания новой базы
+# ---------------------------------------------------------------------------
+class NewDatabaseDialog(QDialog):
+    """Диалог создания новой базы данных или выбора существующей."""
 
-        self.db = self._load_db()
-        self.sort_orders = {col: False for col in sc.COLS}
-        self.display_cols = ['Работа', 'Ед_изм_раб', 'Цена_раб_1', 'Цена_раб_2',
-                             'Материал', 'Ед_изм', 'Расход_1', 'Цена_мат_1', 'Расход_2', 'Цена_мат_2']
-        self.work_units = {}  # mapping: название работы -> ед.изм.
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Новая база данных")
+        self.setFixedSize(500, 300)
 
-        # Меню приложения
-        menubar = tk.Menu(root)
-        root.config(menu=menubar)
-        settings_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Настройки", menu=settings_menu)
-        settings_menu.add_command(label="Настройки", command=self.open_settings)
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Справка", menu=help_menu)
-        help_menu.add_command(label="О программе", command=self.show_about)
+        layout = QVBoxLayout()
 
-        self.notebook = ttk.Notebook(root)
-        self.tab_calc = tk.Frame(self.notebook)
-        self.tab_db = tk.Frame(self.notebook)
-        self.notebook.add(self.tab_calc, text="Составление сметы")
-        self.notebook.add(self.tab_db, text="Справочник")
-        self.notebook.pack(fill=tk.BOTH, expand=True)
-        self.setup_db_tab()
-        self.setup_calc_tab()
-        self.apply_column_widths()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.refresh_db_list()
-        
-        # Предлагаем загрузить черновик, если он существует
-        self.root.after(500, self._ask_load_draft)
+        # Выбор папки
+        form = QFormLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setText(os.path.join(os.getcwd(), "db"))
+        self.folder_edit.setPlaceholderText("Папка для базы данных")
 
-    def show_about(self):
-        """Открывает окно справки с описанием программы и её возможностей."""
-        about_text = (
-            f"""Сметчик PRO 5.2\n
-            Программа для составления смет с поддержкой двух вариантов цены\n\n
-            {"═" * 50}\n\n
-            📋 ОСНОВНЫЕ ВОЗМОЖНОСТИ\n\n
-            1. Составление сметы\n
-               • Добавление работ из справочника с указанием объёма\n
-               • Автоматический расчёт материалов по нормам расхода\n
-               • Два варианта цены с автоматическим расчётом стоимости\n
-               • Сравнение вариантов и расчёт экономии\n
-               • Учёт доп. расходов: накладные, транспортные, подъёмные механизмы, вывоз мусора\n\n
-            2. Справочник работ и материалов\n
-               • Хранение работ с ценами и единицами измерения\n
-               • Привязка материалов к работам с нормами расхода\n
-               • Два варианта цены для каждой позиции\n
-               • Добавление, редактирование, удаление записей\n
-               • Поиск и фильтрация по названию работы или материала\n
-               • Сортировка по любому столбцу\n\n
-            3. Импорт и экспорт\n
-               • Выгрузка сметы в Excel с формулами и форматированием\n
-               • Автоматическое сохранение метаданных (Meta) для восстановления\n
-               • Загрузка ранее экспортированных смет\n
-               • Автоматическое добавление новых записей в справочник при импорте\n\n
-            4. Черновик сметы\n
-               • Автосохранение при изменении сметы\n
-               • Восстановление черновика при запуске программы\n
-               • Ручное сохранение кнопкой «💾 Черновик»\n\n
-            {"═" * 50}\n\n
-            ⌨️ ГОРЯЧИЕ КЛАВИШИ\n\n
-               Ctrl+C / Ctrl+V / Ctrl+X — копировать / вставить / вырезать\n
-               Ctrl+Z — отмена последнего изменения в смете\n
-               ПКМ — контекстное меню (копировать/вставить)\n\n
-            {"═" * 50}\n\n
-            📊 ДВА ВАРИАНТА ЦЕНЫ\n\n
-               Вариант 1 (В1) и Вариант 2 (В2) — независимые цены\n
-               Автоматический расчёт В1 от В2 по коэффициенту\n
-               Расчёт экономии между вариантами в процентах\n\n
-            {"═" * 50}\n\n
-            💾 ХРАНИЛИЩЕ ДАННЫХ\n\n
-               • База данных: SQLite (.db) — нормализованная структура\n
-               • Поддержка Excel (.xlsx) для совместимости\n
-               • Автоматическая миграция из Excel в SQLite\n\n
-            {"═" * 50}\n\n
-            🔧 НАСТРОЙКИ\n\n
-               • Папка для базы данных\n
-               • Папка для сохранения смет\n
-               • Коэффициент автоподстановки цены В1 от В2 для материалов\n
-               • Коэффициент автоподстановки цены В1 от В2 для работ\n\n
-            {"═" * 50}\n\n
-            Версия: 5.2\n
-            Разработчик: @pto_plus\n
-            Поддержка: vremyanca@list.ru\n"""
+        self.name_edit = QLineEdit()
+        self.name_edit.setText("smeta_db")
+        self.name_edit.setPlaceholderText("Имя базы (без расширения)")
+
+        btn_browse = QPushButton("...")
+        btn_browse.clicked.connect(self._browse_folder)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.folder_edit)
+        folder_row.addWidget(btn_browse)
+
+        form.addRow("Папка базы данных:", folder_row)
+        form.addRow("Имя базы данных:", self.name_edit)
+        layout.addLayout(form)
+
+        # Описание
+        desc = QLabel(
+            "Создаёт новую пустую базу данных SQLite в указанной папке.\n"
+            "Все существующие данные в этой папке будут сохранены в резервную копию."
         )
-        from tkinter import scrolledtext
-        win = tk.Toplevel(self.root)
-        win.title("Справка — О программе")
-        win.geometry("650x650")
-        win.resizable(True, True)
-        win.transient(self.root)
-        frame = tk.Frame(win, padx=15, pady=15)
-        frame.pack(fill=tk.BOTH, expand=True)
-        text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, font=("Arial", 10), state="disabled")
-        text.pack(fill=tk.BOTH, expand=True)
-        text.config(state="normal")
-        text.insert("1.0", about_text)
-        text.config(state="disabled")
-        btn = tk.Frame(frame)
-        btn.pack(fill=tk.X, pady=(10, 0))
-        tk.Button(btn, text="Закрыть", bg="#4CAF50", fg="white", width=15,
-                  command=win.destroy).pack(side=tk.RIGHT, padx=5)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #666; font-size: 10pt;")
+        layout.addWidget(desc)
 
-    def open_settings(self):
-        """Открывает окно настроек приложения.
-        
-        Позволяет изменить папку базы данных, папку экспорта и коэффициенты
-        автоподстановки цен.
-        """
-        settings_win = tk.Toplevel(self.root)
-        settings_win.title("Настройки")
-        settings_win.geometry("600x380")
-        settings_win.resizable(False, False)
-        settings_win.transient(self.root)
-        settings_win.grab_set()
-        db_folder_var = tk.StringVar(value=self.db_folder)
-        export_folder_var = tk.StringVar(value=self.export_folder)
-        mat_ratio_var = tk.StringVar(value=str(self.settings.get('auto_price_mat_ratio', 1.35)))
-        work_ratio_var = tk.StringVar(value=str(self.settings.get('auto_price_work_ratio', 2.2)))
-        frame_db = tk.LabelFrame(settings_win, text="Папка для базы данных", padx=10, pady=10)
-        frame_db.pack(fill=tk.X, padx=10, pady=5)
-        tk.Entry(frame_db, textvariable=db_folder_var, width=60).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_db, text="Обзор...", command=lambda: self.browse_folder(db_folder_var)).pack(side=tk.LEFT)
-        frame_export = tk.LabelFrame(settings_win, text="Папка для сохранения смет", padx=10, pady=10)
-        frame_export.pack(fill=tk.X, padx=10, pady=5)
-        tk.Entry(frame_export, textvariable=export_folder_var, width=60).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_export, text="Обзор...", command=lambda: self.browse_folder(export_folder_var)).pack(side=tk.LEFT)
-        frame_ratios = tk.LabelFrame(settings_win, text="Коэффициенты автоподстановки цены В1 от В2", padx=10, pady=10)
-        frame_ratios.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(frame_ratios, text="Материалы (В1 = В2 ×)").grid(row=0, column=0, sticky="w", pady=2)
-        mat_ratio_entry = tk.Entry(frame_ratios, textvariable=mat_ratio_var, width=10)
-        add_clipboard_support(mat_ratio_entry)
-        mat_ratio_entry.grid(row=0, column=1, padx=5, pady=2, sticky="w")
-        tk.Label(frame_ratios, text="(например, 1.35)").grid(row=0, column=2, sticky="w", padx=5)
-        tk.Label(frame_ratios, text="Работы (В1 = В2 ×)").grid(row=1, column=0, sticky="w", pady=2)
-        work_ratio_entry = tk.Entry(frame_ratios, textvariable=work_ratio_var, width=10)
-        add_clipboard_support(work_ratio_entry)
-        work_ratio_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
-        tk.Label(frame_ratios, text="(например, 2.2)").grid(row=1, column=2, sticky="w", padx=5)
-        btn_frame = tk.Frame(settings_win)
-        btn_frame.pack(pady=15)
-        tk.Button(btn_frame, text="Сохранить", bg="#4CAF50", fg="white", width=15,
-                command=lambda: self.save_settings_and_close(
-                    settings_win, db_folder_var.get(), export_folder_var.get(),
-                    mat_ratio_var.get(), work_ratio_var.get()
-                )).pack(side=tk.LEFT, padx=10)
-        tk.Button(btn_frame, text="Отмена", width=15, command=settings_win.destroy).pack(side=tk.LEFT, padx=10)
+        # Кнопки
+        btn_row = QHBoxLayout()
+        btn_create = QPushButton("Создать базу")
+        btn_create.setDefault(True)
+        btn_cancel = QPushButton("Отмена")
 
-    def browse_folder(self, var):
-        """Открывает диалог выбора папки и записывает путь в StringVar.
-        
-        Args:
-            var: tk.StringVar — переменная для хранения пути.
-        """
-        folder = filedialog.askdirectory(title="Выберите папку")
-        if folder:
-            var.set(folder)
+        btn_create.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
 
-    def save_settings_and_close(self, win, db_folder, export_folder, mat_ratio_str, work_ratio_str):
-        """Сохраняет настройки из окна настроек и перезагружает данные.
-        
-        Args:
-            win: tk.Toplevel — окно настроек для закрытия.
-            db_folder (str): путь к папке базы данных.
-            export_folder (str): путь к папке экспорта.
-            mat_ratio_str (str): коэффициент для материалов.
-            work_ratio_str (str): коэффициент для работ.
-        """
-        os.makedirs(db_folder, exist_ok=True)
-        os.makedirs(export_folder, exist_ok=True)
-        try:
-            mat_ratio = float(mat_ratio_str.replace(',', '.'))
-            work_ratio = float(work_ratio_str.replace(',', '.'))
-            if mat_ratio <= 0 or work_ratio <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Ошибка", "Коэффициенты должны быть положительными числами.")
-            return
-        self.db_folder = db_folder
-        self.export_folder = export_folder
-        self.db_file = os.path.join(self.db_folder, self.active_db_filename)
-        self.settings['auto_price_mat_ratio'] = mat_ratio
-        self.settings['auto_price_work_ratio'] = work_ratio
-        save_settings({
-            'db_folder': db_folder,
-            'export_folder': export_folder,
-            'active_db_filename': self.active_db_filename,
-            'auto_price_mat_ratio': mat_ratio,
-            'auto_price_work_ratio': work_ratio,
-        })
-        self.db = self._load_db()
-        self.refresh_db_table()
-        self.update_combobox()
-        self.refresh_db_list()
-        messagebox.showinfo("Готово", "Настройки сохранены.")
-        win.destroy()
+        btn_row.addStretch()
+        btn_row.addWidget(btn_create)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
 
-    def save_column_widths(self):
-        """Сохраняет текущие ширины колонок в настройки."""
-        db_widths = {}
-        if hasattr(self, 'tree_db'):
-            for col in self.display_cols:
-                try:
-                    db_widths[col] = self.tree_db.column(col)['width']
-                except Exception:
-                    pass
-        
-        calc_widths = {}
-        if hasattr(self, 'tree_smeta'):
-            for col in self.calc_cols:
-                try:
-                    calc_widths[col] = self.tree_smeta.column(col)['width']
-                except Exception:
-                    pass
-        
-        self.settings['db_col_widths'] = db_widths
-        self.settings['calc_col_widths'] = calc_widths
-        save_settings(self.settings)
+        self.setLayout(layout)
 
-    def apply_column_widths(self):
-        """Применяет сохранённые ширины колонок из настроек."""
-        db_widths = self.settings.get('db_col_widths', {})
-        if hasattr(self, 'tree_db'):
-            for col, width in db_widths.items():
-                try:
-                    self.tree_db.column(col, width=width)
-                except Exception:
-                    pass
-        
-        calc_widths = self.settings.get('calc_col_widths', {})
-        if hasattr(self, 'tree_smeta'):
-            for col, width in calc_widths.items():
-                try:
-                    self.tree_smeta.column(col, width=width)
-                except Exception:
-                    pass
+    def _browse_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Выберите папку")
+        if d:
+            self.folder_edit.setText(d)
 
-    def on_closing(self):
-        """Обработчик закрытия окна — сохраняет ширины колонок и черновик сметы."""
-        self.save_column_widths()
-        self._save_draft()
-        self.root.destroy()
-
-    def _load_db(self):
-        """Загружает базу данных (с поддержкой SQLite и Excel).
-        
-        Returns:
-            pd.DataFrame: данные базы в плоском формате (LEGACY_COLS).
-        """
-        if self.db_manager is not None:
-            return self.db_manager.get_legacy_dataframe()
-        
-        # Если это SQLite-база, а db_manager по какой-то причине не инициализирован
-        # — создаём его на лету
-        if (self.db_file and self.db_file.lower().endswith('.db')
-                and HAS_DB_MANAGER):
-            db_name = os.path.splitext(os.path.basename(self.db_file))[0]
-            self.db_manager = DatabaseManager(self.db_folder, db_name)
-            return self.db_manager.get_legacy_dataframe()
-        
-        if not os.path.exists(self.db_file):
-            return pd.DataFrame(columns=sc.COLS)
-        try:
-            raw = pd.read_excel(self.db_file)
-        except ValueError as e:
-            if 'filetype' in str(e):
-                return pd.DataFrame(columns=sc.COLS)
-            raise
-        except Exception as e:
-            messagebox.showerror("Ошибка БД", f"Не удалось загрузить базу:\n{e}")
-            return pd.DataFrame(columns=sc.COLS)
-        is_legacy_only = (all(c in raw.columns for c in sc.LEGACY_COLS)
-                        and not all(c in raw.columns for c in sc.COLS))
-        migrated = sc.migrate_legacy_df(raw)
-        if is_legacy_only:
-            try:
-                backup_path = self.db_file.rsplit('.', 1)[0] + "_backup_old_format.xlsx"
-                if not os.path.exists(backup_path):
-                    raw.to_excel(backup_path, index=False)
-                migrated.to_excel(self.db_file, index=False)
-                messagebox.showinfo("База обновлена", 
-                    f"Формат обновлён под два варианта цены.\n"
-                    f"Резервная копия: {os.path.basename(backup_path)}")
-            except Exception as e:
-                messagebox.showwarning("Внимание", 
-                    f"База мигрирована в памяти, но не удалось сохранить файл:\n{e}")
-        return migrated
-
-    def setup_db_tab(self):
-        """Настраивает вкладку «Справочник»: поля ввода, кнопки, дерево базы данных."""
-        db_sel_frame = tk.Frame(self.tab_db)
-        db_sel_frame.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(db_sel_frame, text="📂 База данных:").pack(side=tk.LEFT)
-        self.db_combo = ttk.Combobox(db_sel_frame, width=40, state="readonly")
-        self.db_combo.pack(side=tk.LEFT, padx=5)
-        tk.Button(db_sel_frame, text="➕ Создать", command=self.create_new_db).pack(side=tk.LEFT, padx=2)
-        tk.Button(db_sel_frame, text="🗑 Удалить", command=self.delete_current_db).pack(side=tk.LEFT, padx=2)
-        tk.Button(db_sel_frame, text="🔄 Обновить", command=self.refresh_db_list).pack(side=tk.LEFT, padx=2)
-        self.db_combo.bind("<<ComboboxSelected>>", self.on_db_selected)
-
-        frame_input = tk.LabelFrame(self.tab_db, text="Редактор базы", padx=10, pady=10)
-        frame_input.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(frame_input, text="Наименование работы:").grid(row=0, column=0, sticky="nw")
-        self.work_text = tk.Text(frame_input, width=110, height=2, font=("Arial", 10))
-        add_clipboard_support(self.work_text)
-        add_context_menu(self.work_text)
-        self.work_text.grid(row=0, column=0, columnspan=4, padx=5, pady=(20, 5), sticky="w")
-        self.entries = {}
-        tk.Label(frame_input, text="Ед. изм. работы:").grid(row=1, column=0, sticky="w", pady=2)
-        e = tk.Entry(frame_input, width=18)
-        add_clipboard_support(e)
-        add_context_menu(e)
-        e.grid(row=1, column=1, padx=5, pady=2, sticky="w")
-        self.entries['Ед_изм_раб'] = e
-        tk.Label(frame_input, text="Материал:").grid(row=1, column=2, sticky="w", pady=2)
-        e = tk.Entry(frame_input, width=40)
-        add_clipboard_support(e)
-        add_context_menu(e)
-        e.grid(row=1, column=3, padx=5, pady=2, sticky="w")
-        self.entries['Материал'] = e
-        tk.Label(frame_input, text="Ед. изм. материала:").grid(row=2, column=0, sticky="w", pady=2)
-        e = tk.Entry(frame_input, width=18)
-        add_clipboard_support(e)
-        add_context_menu(e)
-        e.grid(row=2, column=1, padx=5, pady=2, sticky="w")
-        self.entries['Ед_изм'] = e
-        frame_v1 = tk.LabelFrame(frame_input, text="Вариант 1", padx=8, pady=6)
-        frame_v1.grid(row=3, column=0, columnspan=2, padx=5, pady=10, sticky="we")
-        frame_v2 = tk.LabelFrame(frame_input, text="Вариант 2", padx=8, pady=6)
-        frame_v2.grid(row=3, column=2, columnspan=2, padx=5, pady=10, sticky="we")
-        variant_fields = [("Расход материала: ", "Расход"), ("Цена материала: ", "Цена_мат"), ("Цена работы (ед.): ", "Цена_раб")]
-        for frame, suffix in ((frame_v1, "_1"), (frame_v2, "_2")):
-            for r, (label, base) in enumerate(variant_fields):
-                key = base + suffix
-                tk.Label(frame, text=label).grid(row=r, column=0, sticky="w", pady=2)
-                en = tk.Entry(frame, width=16)
-                add_clipboard_support(en)
-                add_context_menu(en)
-                en.grid(row=r, column=1, padx=5, pady=2)
-                self.entries[key] = en
-        
-        # ✅ ЧЕКБОКС "БЕЗ МАТЕРИАЛОВ"
-        self.no_materials_var = tk.BooleanVar(value=False)
-        chk_frame = tk.Frame(frame_input)
-        chk_frame.grid(row=4, column=0, columnspan=4, pady=5, sticky="w")
-        tk.Checkbutton(chk_frame, text="Без материалов (только работа)", 
-                       variable=self.no_materials_var, font=("Arial", 10)).pack(side=tk.LEFT)
-        tk.Label(chk_frame, text="  (если отмечено — поля материала игнорируются)", 
-                 fg="gray", font=("Arial", 9)).pack(side=tk.LEFT)
-
-        btn_f = tk.Frame(self.tab_db)
-        btn_f.pack(pady=5)
-        self.btn_edit = tk.Button(btn_f, text="✏️ Редактировать", bg="#FF9800", fg="white",
-                   command=self.edit_to_db, state="disabled")
-        self.btn_edit.pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_f, text="➕ Добавить запись", bg="#4CAF50", fg="white",
-                  command=self.save_to_db).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_f, text="🗑 Удалить из базы", bg="#f44336", fg="white",
-                  command=self.delete_from_db).pack(side=tk.LEFT, padx=5)
-
-        filter_frame = tk.Frame(self.tab_db)
-        filter_frame.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(filter_frame, text="🔍 Поиск работы:").pack(side=tk.LEFT)
-        self.filter_work = tk.Entry(filter_frame, width=35)
-        self.filter_work.pack(side=tk.LEFT, padx=5)
-        tk.Label(filter_frame, text="🔍 Поиск материала:").pack(side=tk.LEFT, padx=(10, 0))
-        self.filter_mat = tk.Entry(filter_frame, width=35)
-        self.filter_mat.pack(side=tk.LEFT, padx=5)
-        tk.Button(filter_frame, text="Сброс", command=self.clear_db_filters).pack(side=tk.RIGHT, padx=5)
-        self.filter_work.bind('<KeyRelease>', lambda e: self.refresh_db_table())
-        self.filter_mat.bind('<KeyRelease>', lambda e: self.refresh_db_table())
-
-        db_tree_frame = tk.Frame(self.tab_db)
-        db_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.tree_db = ttk.Treeview(db_tree_frame, columns=self.display_cols, show='headings', style='Treeview')
-        for c in self.display_cols:
-            self.tree_db.heading(c, text=c, command=lambda _col=c: self.sort_column(_col))
-            width = 250 if c == "Работа" else 100 if "Цена" in c else 80
-            self.tree_db.column(c, width=width, minwidth=width)
-        db_yscroll = ttk.Scrollbar(db_tree_frame, orient="vertical", command=self.tree_db.yview)
-        self.tree_db.configure(yscrollcommand=db_yscroll.set)
-        self.tree_db.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        db_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree_db.bind("<<TreeviewSelect>>", self.load_to_entries)
-        self.refresh_db_table()
-
-    def clear_db_filters(self):
-        """Очищает поля поиска и сбрасывает режим редактирования."""
-        self.filter_work.delete(0, tk.END)
-        self.filter_mat.delete(0, tk.END)
-        self.editing_work_id = None
-        self.btn_edit.config(state="disabled")
-        self.refresh_db_table()
-
-    def sort_column(self, col):
-        """Переключает сортировку таблицы базы данных по указанному столбцу.
-        
-        Args:
-            col (str): название столбца для сортировки.
-        """
-        self.sort_orders[col] = not self.sort_orders[col]
-        self.db = self.db.sort_values(by=col, ascending=self.sort_orders[col]).reset_index(drop=True)
-        self.refresh_db_table()
-
-    def save_to_db(self):
-        """Добавляет новую запись в базу данных или обновляет существующую по имени.
-        
-        Проверяет, существует ли работа с таким названием. Если да — обновляет,
-        если нет — создаёт новую запись. Обрабатывает оба варианта (SQLite и Excel).
-        """
-        try:
-            data = {'Работа': self.work_text.get("1.0", tk.END).strip()}
-            for c in ('Ед_изм_раб', 'Материал', 'Ед_изм'):
-                data[c] = self.entries[c].get().strip()
-            
-            if not data['Работа']:
-                return messagebox.showerror("Ошибка", "Введите наименование работы.")
-            
-            # ✅ Проверяем чекбокс "Без материалов"
-            no_materials = self.no_materials_var.get()
-            if no_materials or data['Материал'] in ("", "-", "0"):
-                data['Материал'] = "-"
-                data['Ед_изм'] = "-"
-                for nf in ('Расход_1', 'Цена_мат_1', 'Расход_2', 'Цена_мат_2'):
-                    data[nf] = 0.0
-            else:
-                for nf in ('Расход_1', 'Цена_мат_1', 'Расход_2', 'Цена_мат_2'):
-                    raw = self.entries[nf].get().strip()
-                    if raw in ("", "-", " "):
-                        data[nf] = 0.0
-                    else:
-                        try:
-                            data[nf] = float(raw.replace(',', '.'))
-                        except ValueError:
-                            return messagebox.showerror("Ошибка", f"Поле «{nf}» должно быть числом.")
-            
-            # ✅ Парсим цены работы (с автоподстановкой В1 от В2)
-            mat_ratio = self.settings.get('auto_price_mat_ratio', 1.35)
-            work_ratio = self.settings.get('auto_price_work_ratio', 2.2)
-            
-            for price_field in ('Цена_раб_1', 'Цена_раб_2'):
-                raw = self.entries[price_field].get().strip()
-                if raw == "" or raw == "-":
-                    data[price_field] = 0.0
-                else:
-                    try:
-                        data[price_field] = float(raw.replace(',', '.'))
-                    except ValueError:
-                        return messagebox.showerror("Ошибка", f"Поле «{price_field}» должно быть числом.")
-            
-            # ✅ Автоподстановка В1 от В2, если В1 не задан
-            if data['Цена_раб_2'] > 0 and data['Цена_раб_1'] == 0.0:
-                data['Цена_раб_1'] = round(data['Цена_раб_2'] * work_ratio, 2)
-                self.entries['Цена_раб_1'].delete(0, tk.END)
-                self.entries['Цена_раб_1'].insert(0, str(data['Цена_раб_1']))
-            
-            if not no_materials and data['Материал'] != "-":
-                if data['Цена_мат_2'] > 0 and data['Цена_мат_1'] == 0.0:
-                    data['Цена_мат_1'] = round(data['Цена_мат_2'] * mat_ratio, 2)
-                    self.entries['Цена_мат_1'].delete(0, tk.END)
-                    self.entries['Цена_мат_1'].insert(0, str(data['Цена_мат_1']))
-            
-            work_name = data['Работа']
-            
-            if self.db_manager is not None:
-                # ✅ Сохранение через нормализованную БД (SQLite)
-                work = self.db_manager.get_work_by_name(work_name)
-                if work is None:
-                    work_id = self.db_manager.add_work(
-                        work_name, data['Ед_изм_раб'],
-                        data['Цена_раб_1'], data['Цена_раб_2']
-                    )
-                else:
-                    work_id = work['id']
-                    self.db_manager.update_work(
-                        work_id, unit=data['Ед_изм_раб'],
-                        price_1=data['Цена_раб_1'], price_2=data['Цена_раб_2']
-                    )
-
-                # ✅ Очищаем старые связи только для НОВЫХ работ (у которых нет материалов)
-                # Для существующих работ с материалами — просто добавляем новый материал
-                existing_links = self.db_manager.work_materials_cache[
-                    self.db_manager.work_materials_cache['work_id'] == work_id
-                ]
-                if existing_links.empty:
-                    self.db_manager.delete_work_material_links_by_work(work_id)
-
-                mat_name = data['Материал']
-                if mat_name != "-":
-                    mat = self.db_manager.get_material_by_name(mat_name)
-                    if mat is None:
-                        mat_id = self.db_manager.add_material(
-                            mat_name, data['Ед_изм'],
-                            data['Цена_мат_1'], data['Цена_мат_2']
-                        )
-                    else:
-                        mat_id = mat['id']
-                        self.db_manager.update_material(
-                            mat_id, unit=data['Ед_изм'],
-                            price_1=data['Цена_мат_1'], price_2=data['Цена_мат_2']
-                        )
-                    self.db_manager.add_work_material_link(
-                        work_id, mat_id,
-                        data['Расход_1'], data['Расход_2']
-                    )
-
-                self.db_manager.flush()
-                self.db = self.db_manager.get_legacy_dataframe()
-            else:
-                # ✅ Старый метод с Excel
-                mask = ((self.db['Работа'].astype(str).str.strip() == work_name)
-                        & (self.db['Материал'].astype(str).str.strip() == data['Материал']))
-                self.db = self.db[~mask].reset_index(drop=True)
-                new_row = pd.DataFrame([data], columns=sc.COLS)
-                self.db = pd.concat([self.db, new_row], ignore_index=True)
-                os.makedirs(self.db_folder, exist_ok=True)
-                self.db.to_excel(self.db_file, index=False)
-            
-            if hasattr(self, 'filter_work'):
-                self.filter_work.delete(0, tk.END)
-            if hasattr(self, 'filter_mat'):
-                self.filter_mat.delete(0, tk.END)
-            
-            self.refresh_db_table()
-            self.update_combobox()
-            
-            msg = "Запись добавлена в базу."
-            if no_materials:
-                msg += "\n(работа без материалов)"
-            messagebox.showinfo("Готово", msg)
-            self.refresh_estimate_if_needed(work_name)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось добавить:\n{e}")
-
-    def edit_to_db(self):
-        """Редактирует выбранную запись в базе данных по ID.
-        
-        Обновляет данные работы и материалов. Если название работы изменено —
-        удаляет старую запись и создаёт новую.
-        """
-        if self.editing_work_id is None:
-            return messagebox.showwarning("Внимание", "Выберите запись для редактирования.")
-        
-        try:
-            work_name = self.work_text.get("1.0", tk.END).strip()
-            if not work_name:
-                return messagebox.showerror("Ошибка", "Введите наименование работы.")
-            
-            # ✅ Проверяем чекбокс "Без материалов"
-            no_materials = self.no_materials_var.get()
-            material_name = self.entries['Материал'].get().strip()
-            if no_materials or material_name in ("", "-", "0"):
-                material_name = "-"
-            
-            # Парсим данные материала
-            material_data = {}
-            if not no_materials and material_name != "-":
-                material_data = {
-                    'Ед_изм': self.entries['Ед_изм'].get().strip(),
-                    'Расход_1': float(self.entries['Расход_1'].get().replace(',', '.')) if self.entries['Расход_1'].get().strip() else 0.0,
-                    'Цена_мат_1': float(self.entries['Цена_мат_1'].get().replace(',', '.')) if self.entries['Цена_мат_1'].get().strip() else 0.0,
-                    'Расход_2': float(self.entries['Расход_2'].get().replace(',', '.')) if self.entries['Расход_2'].get().strip() else 0.0,
-                    'Цена_мат_2': float(self.entries['Цена_мат_2'].get().replace(',', '.')) if self.entries['Цена_мат_2'].get().strip() else 0.0,
-                }
-            
-            # Парсим цены работы
-            mat_ratio = self.settings.get('auto_price_mat_ratio', 1.35)
-            work_ratio = self.settings.get('auto_price_work_ratio', 2.2)
-            unit_w = self.entries['Ед_изм_раб'].get().strip()
-            price_w1 = float(self.entries['Цена_раб_1'].get().replace(',', '.')) if self.entries['Цена_раб_1'].get().strip() else 0.0
-            price_w2 = float(self.entries['Цена_раб_2'].get().replace(',', '.')) if self.entries['Цена_раб_2'].get().strip() else 0.0
-            
-            # ✅ Автоподстановка В1 от В2
-            if price_w2 > 0 and price_w1 == 0.0:
-                price_w1 = round(price_w2 * work_ratio, 2)
-                self.entries['Цена_раб_1'].delete(0, tk.END)
-                self.entries['Цена_раб_1'].insert(0, str(price_w1))
-            
-            if not no_materials and material_name != "-" and material_data:
-                if material_data['Цена_мат_2'] > 0 and material_data['Цена_мат_1'] == 0.0:
-                    material_data['Цена_мат_1'] = round(material_data['Цена_мат_2'] * mat_ratio, 2)
-                    self.entries['Цена_мат_1'].delete(0, tk.END)
-                    self.entries['Цена_мат_1'].insert(0, str(material_data['Цена_мат_1']))
-            
-            if self.db_manager is not None:
-                # Обновляем работу
-                self.db_manager.update_work(
-                    self.editing_work_id,
-                    unit=unit_w,
-                    price_1=price_w1,
-                    price_2=price_w2
-                )
-                
-                # Если изменилось название работы — удаляем старую и создаём новую
-                old_work = self.db_manager.get_work_by_name(work_name)
-                if old_work is None or int(old_work['id']) != self.editing_work_id:
-                    # Удаляем старую запись по ID
-                    self.db_manager.delete_work(self.editing_work_id)
-                    # Добавляем новую
-                    new_id = self.db_manager.add_work(
-                        work_name, unit_w, price_w1, price_w2
-                    )
-                    self.editing_work_id = new_id
-                    # Очищаем старые связи для новой работы
-                    self.db_manager.delete_work_material_links_by_work(new_id)
-                else:
-                    # Очищаем старые связи
-                    self.db_manager.delete_work_material_links_by_work(self.editing_work_id)
-                
-                # Обновляем/добавляем материал
-                if not no_materials and material_name != "-":
-                    mat = self.db_manager.get_material_by_name(material_name)
-                    if mat is None:
-                        mat_id = self.db_manager.add_material(
-                            material_name, material_data['Ед_изм'],
-                            material_data['Цена_мат_1'], material_data['Цена_мат_2']
-                        )
-                    else:
-                        mat_id = int(mat['id'])
-                        self.db_manager.update_material(
-                            mat_id,
-                            unit=material_data['Ед_изм'],
-                            price_1=material_data['Цена_мат_1'],
-                            price_2=material_data['Цена_мат_2']
-                        )
-                    self.db_manager.add_work_material_link(
-                        self.editing_work_id, mat_id,
-                        material_data['Расход_1'], material_data['Расход_2']
-                    )
-                
-                self.db_manager.flush()
-                self.db = self.db_manager.get_legacy_dataframe()
-            
-            if hasattr(self, 'filter_work'):
-                self.filter_work.delete(0, tk.END)
-            if hasattr(self, 'filter_mat'):
-                self.filter_mat.delete(0, tk.END)
-            
-            self.refresh_db_table()
-            self.update_combobox()
-            
-            msg = "Запись редактирована."
-            if no_materials:
-                msg += "\n(работа без материалов)"
-            messagebox.showinfo("Готово", msg)
-            self.refresh_estimate_if_needed(work_name)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось редактировать:\n{e}")
-
-    def refresh_estimate_if_needed(self, work_name):
-        rows = self._gather_rows()
-        used = any(sc.is_work(str(v[1])) and sc.clean_name(v[1]) == work_name for v in rows)
-        if not used:
-            return
-        new_rows = []
-        i, n = 0, len(rows)
-        while i < n:
-            vals = rows[i]
-            name = str(vals[1]).strip()
-            if sc.is_work(name) and sc.clean_name(name) == work_name:
-                vol = sc.to_float(vals[4], 1.0)
-                block = sc.build_work_block(work_name, vol, self.db, 1, self.db_manager)
-                if block:
-                    new_rows.extend(block)
-                i += 1
-                while i < n and (sc.is_material(str(rows[i][1])) or sc.is_total(str(rows[i][1]))):
-                    i += 1
-                continue
-            new_rows.append(vals)
-            i += 1
-        self.tree_smeta.delete(*self.tree_smeta.get_children())
-        for vals in new_rows:
-            tags = ("section",) if sc.is_section(str(vals[1])) else ()
-            self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
-        self.full_rebuild()
-
-    def delete_from_db(self):
-        """Удаляет выбранную запись из базы данных."""
-        sel = self.tree_db.selection()
-        if not sel:
-            return messagebox.showwarning("Внимание", "Выберите строку для удаления.")
-        if not messagebox.askyesno("Подтверждение", "Удалить выбранную запись из базы?"):
-            return
-        try:
-            idx_to_delete = int(sel[0])
-            if idx_to_delete not in self.db.index:
-                return messagebox.showerror("Ошибка", "Индекс строки не найден в базе.")
-            
-            work_name = str(self.db.loc[idx_to_delete, 'Работа']).strip()
-            
-            if self.db_manager is not None:
-                work = self.db_manager.get_work_by_name(work_name)
-                if work is None:
-                    return messagebox.showerror("Ошибка", f"Работа «{work_name}» не найдена в базе.")
-                work_id = work['id']
-                self.db_manager.delete_work(work_id)
-                self.db_manager.flush()
-                self.db = self.db_manager.get_legacy_dataframe()
-            else:
-                mask = self.db['Работа'].astype(str).str.strip() == work_name
-                self.db = self.db[~mask].reset_index(drop=True)
-                os.makedirs(self.db_folder, exist_ok=True)
-                self.db.to_excel(self.db_file, index=False)
-            
-            self.refresh_db_table()
-            self.update_combobox()
-            messagebox.showinfo("Готово", f"Запись «{work_name}» удалена.")
-            self.editing_work_id = None  # Сбрасываем после удаления
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось удалить запись:\n{e}")
-
-    def refresh_db_table(self):
-        """Обновляет отображение таблицы базы данных с учётом фильтров."""
-        if not hasattr(self, 'tree_db'):
-            return
-        self.tree_db.delete(*self.tree_db.get_children())
-        df = self.db.copy()
-        work_q = self.filter_work.get().strip().lower()
-        mat_q = self.filter_mat.get().strip().lower()
-        if work_q:
-            df = df[df['Работа'].astype(str).str.lower().str.contains(work_q, na=False)]
-        if mat_q:
-            df = df[df['Материал'].astype(str).str.lower().str.contains(mat_q, na=False)]
-        for idx, r in df.iterrows():
-            vals = [r[c] for c in self.display_cols]
-            self.tree_db.insert("", tk.END, iid=str(idx), values=vals)
-        # Сбрасываем режим редактирования при обновлении таблицы
-        self.editing_work_id = None
-        if hasattr(self, 'btn_edit'):
-            self.btn_edit.config(state="disabled")
-
-    def load_to_entries(self, event):
-        """Загружает данные выбранной строки в поля ввода редактора.
-        
-        Args:
-            event: событие выбора строки в Treeview.
-        """
-        sel = self.tree_db.selection()
-        if not sel:
-            self.editing_work_id = None
-            self.btn_edit.config(state="disabled")
-            return
-        try:
-            idx = int(sel[0])
-            row = self.db.loc[idx]
-            work_name = str(row['Работа']).strip()
-            # Находим ID работы в db_manager
-            if self.db_manager is not None:
-                work = self.db_manager.get_work_by_name(work_name)
-                if work is not None:
-                    self.editing_work_id = int(work['id'])
-                    self.btn_edit.config(state="normal")
-                else:
-                    self.editing_work_id = None
-                    self.btn_edit.config(state="disabled")
-            else:
-                self.editing_work_id = None
-                self.btn_edit.config(state="disabled")
-        except (KeyError, ValueError):
-            self.editing_work_id = None
-            self.btn_edit.config(state="disabled")
-            return
-        self.work_text.delete("1.0", tk.END)
-        self.work_text.insert("1.0", row['Работа'])
-        for c in sc.COLS[1:]:
-            self.entries[c].delete(0, tk.END)
-            self.entries[c].insert(0, row[c])
-        # ✅ Сбрасываем чекбокс "Без материалов" в зависимости от содержимого
-        mat_val = str(row.get('Материал', '')).strip()
-        self.no_materials_var.set(mat_val in ("", "-", "0"))
-
-    def update_combobox(self):
-        """Обновляет выпадающий список работ в калькуляторе сметы."""
-        if not hasattr(self, 'work_combo'):
-            return
-        self.editing_work_id = None  # Сбрасываем при обновлении
-        if not self.db.empty:
-            # Создаём словарь: название -> ед.изм
-            self.work_units = {}
-            for work_name in self.db['Работа'].astype(str).unique():
-                work_name = str(work_name).strip()
-                if work_name:
-                    unit = str(self.db[self.db['Работа'].astype(str).str.strip() == work_name]['Ед_изм_раб'].iloc[0]).strip()
-                    self.work_units[work_name] = unit
-            # Формируем список отображаемых значений
-            display_list = sorted([f"{name} ({unit})" for name, unit in self.work_units.items()])
-            self.all_works_list = display_list
-            self.work_combo['values'] = self.all_works_list
-        else:
-            self.all_works_list = []
-            self.work_combo['values'] = []
-            self.work_units = {}
-
-    def _extract_work_name(self, display_text):
-        """Извлекает чистое название работы из строки 'Название (ед.изм.)'.
-        
-        Args:
-            display_text (str): текст из выпадающего списка.
-            
-        Returns:
-            str: название работы без единицы измерения.
-        """
-        if not display_text:
-            return display_text
-        # Ищем последнее ' (' и извлекаем часть до него
-        idx = display_text.rfind(' (')
-        if idx >= 0:
-            return display_text[:idx].strip()
-        return display_text.strip()
-
-    def filter_works_combo(self, event=None):
-        typed = self.work_combo.get().strip()
-        if not hasattr(self, 'work_units'):
-            return
-        if not typed:
-            self.work_combo['values'] = self.all_works_list
-            return
-        lower_typed = typed.lower()
-        # Фильтруем по названию работы (без единицы измерения)
-        filtered_names = [name for name in self.work_units if lower_typed in name.lower()]
-        self.all_works_list = sorted([f"{name} ({self.work_units[name]})" for name in filtered_names])
-        self.work_combo['values'] = self.all_works_list
-        self.work_combo.icursor(tk.END)
-
-    def refresh_db_list(self):
-        """Обновляет список доступных баз данных в выпадающем списке."""
-        if not os.path.exists(self.db_folder):
-            os.makedirs(self.db_folder, exist_ok=True)
-        files = os.listdir(self.db_folder)
-
-        # Собираем Excel файлы
-        db_files = [f for f in files if f.lower().endswith('.xlsx')]
-
-        # Собираем SQLite базы (.db файлы)
-        if HAS_DB_MANAGER:
-            sqlite_bases = set()
-            for f in files:
-                if f.lower().endswith('.db'):
-                    sqlite_bases.add(f)
-            db_files.extend(sorted(sqlite_bases))
-
-        db_files = sorted(db_files)
-        self.db_combo['values'] = db_files
-
-        if self.active_db_filename in db_files:
-            self.db_combo.set(self.active_db_filename)
-        elif db_files:
-            self.db_combo.set(db_files[0])
-            self.on_db_selected()
-
-    def on_db_selected(self, event=None):
-        """Вызывается при выборе базы данных из выпадающего списка.
-        
-        Args:
-            event: событие выбора из Combobox (необязательный аргумент).
-        """
-        new_db = self.db_combo.get()
-        if new_db and new_db != self.active_db_filename:
-            self.active_db_filename = new_db
-
-            # Для SQLite баз
-            if new_db.endswith('.db') and HAS_DB_MANAGER:
-                db_name = new_db[:-len('.db')]
-                self.db_manager = DatabaseManager(self.db_folder, db_name)
-                self.db_file = os.path.join(self.db_folder, f'{db_name}.db')
-            else:
-                # Excel база
-                if HAS_DB_MANAGER:
-                    self.db_manager = None
-                self.db_file = os.path.join(self.db_folder, new_db)
-
-            self._save_active_db_to_settings()
-            self.db = self._load_db()
-            self.refresh_db_table()
-            self.update_combobox()
-
-    def _save_active_db_to_settings(self):
-        """Сохраняет имя активной базы данных в настройки."""
-        settings = load_settings()
-        settings['active_db_filename'] = self.active_db_filename
-        save_settings(settings)
-
-    # --------------------------------------------------------------------------
-    # Черновик сметы
-    # --------------------------------------------------------------------------
-    def _get_draft_path(self):
-        """Возвращает путь к файлу черновика сметы.
-        
-        Returns:
-            str: полный путь к файлу smeta_draft.json в папке базы данных.
-        """
-        return os.path.join(self.db_folder, DRAFT_FILE)
-
-    def _has_draft(self):
-        """Проверяет, существует ли черновик сметы.
-        
-        Returns:
-            bool: True если черновик существует.
-        """
-        return os.path.exists(self._get_draft_path())
-
-    def _save_draft(self):
-        """Сохраняет текущее состояние сметы в файл черновика.
-        
-        Сохраняет:
-        - Название сметы.
-        - Все строки сметы (включая разделы и работы).
-        - Дополнительные расходы (накладные, подъёмные, вывоз мусора).
-        """
-        try:
-            draft_data = {
-                'title': self.title_entry.get(),
-                'rows': self._gather_rows(),
-                'extra': {key: val.get() for key, val in self.extra_entries.items()}
-            }
-            os.makedirs(self.db_folder, exist_ok=True)
-            with open(self._get_draft_path(), 'w', encoding='utf-8') as f:
-                json.dump(draft_data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass  # Тихо игнорируем ошибки сохранения
-
-    def _load_draft(self, draft_data):
-        """Загружает данные черновика в смету.
-        
-        Args:
-            draft_data (dict): данные черновика из JSON.
-        """
-        if draft_data.get('title'):
-            self.title_entry.delete(0, tk.END)
-            self.title_entry.insert(0, draft_data['title'])
-        self.tree_smeta.delete(*self.tree_smeta.get_children())
-        for vals in draft_data.get('rows', []):
-            tags = ("section",) if sc.is_section(str(vals[1])) else ()
-            self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
-        extra = draft_data.get('extra', {})
-        for key, val in extra.items():
-            if key in self.extra_entries:
-                self.extra_entries[key].delete(0, tk.END)
-                self.extra_entries[key].insert(0, str(val))
-        self.full_rebuild()
-
-    def _ask_load_draft(self):
-        """Предлагает загрузить черновик при запуске программы.
-        
-        Если существует сохранённый черновик, показывает диалог с вопросом
-        о его восстановлении.
-        """
-        if not self._has_draft():
-            return
-        if not messagebox.askyesno("Восстановление", "Обнаружен несохранённый черновик сметы.\nВосстановить его при запуске?"):
-            return
-        try:
-            with open(self._get_draft_path(), 'r', encoding='utf-8') as f:
-                draft_data = json.load(f)
-            self._load_draft(draft_data)
-            messagebox.showinfo("Готово", "Черновик сметы восстановлен.")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось загрузить черновик:\n{e}")
-
-    def _manual_save_draft(self):
-        """Сохраняет черновик сметы и показывает сообщение об успехе."""
-        self._save_draft()
-        messagebox.showinfo("Готово", "Черновик сметы сохранён.\nОн будет автоматически загружен при следующем запуске программы.")
-
-    def create_new_db(self):
-        """Создаёт новую пустую базу данных (SQLite).
-        
-        Открывает диалог ввода имени файла, создаёт .db базу и загружает её.
-        """
-        new_name = simpledialog.askstring("Новая база", "Введите имя файла (например, База_Кровля.db):")
-        if not new_name:
-            return
-        new_name = re.sub(r'[<>:"/\|?*]', '_', new_name)
-        if not new_name.lower().endswith('.db'):
-            new_name += '.db'
-        new_path = os.path.join(self.db_folder, new_name)
-        if os.path.exists(new_path):
-            return messagebox.showwarning("Внимание", "Файл уже существует.")
-
-        # Всегда создаём через DatabaseManager (SQLite)
-        db_name = new_name.replace('.db', '')
-        self.active_db_filename = new_name
-        self.db_manager = DatabaseManager(self.db_folder, db_name)
-        display_name = f'{db_name}.db'
-
-        self.refresh_db_list()
-        self.db_combo.set(display_name)
-        self.on_db_selected()
-        messagebox.showinfo("Готово", f"База «{display_name}» создана и загружена.")
-
-    def delete_current_db(self):
-        """Удаляет текущую базу данных с подтверждением пользователя."""
-        if not self.active_db_filename:
-            return
-        if not messagebox.askyesno("Подтверждение", f"Удалить базу «{self.active_db_filename}»?\nЭто действие нельзя отменить."):
-            return
-        path = os.path.join(self.db_folder, self.active_db_filename)
-        try:
-            os.remove(path)
-            if self.db_manager:
-                self.db_manager = None
-            self.refresh_db_list()
-            if self.db_combo['values']:
-                self.db_combo.set(self.db_combo['values'][0])
-                self.on_db_selected()
-            else:
-                self.db = pd.DataFrame(columns=sc.COLS)
-                self.refresh_db_table()
-                self.update_combobox()
-            messagebox.showinfo("Готово", "База удалена.")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось удалить файл:\n{e}")
-
-    def setup_calc_tab(self):
-        """Настраивает вкладку «Составление сметы»: поля, кнопки, дерево сметы."""
-        frame_title = tk.Frame(self.tab_calc, pady=4)
-        frame_title.pack(fill=tk.X, padx=10)
-        tk.Label(frame_title, text="Наименование сметы / объект:").pack(side=tk.LEFT)
-        self.title_entry = tk.Entry(frame_title)
-        add_clipboard_support(self.title_entry)
-        add_context_menu(self.title_entry)
-        self.title_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.title_entry.bind('<KeyRelease>', lambda e: self._save_draft())  # автосохранение при изменении заголовка
-        frame_top = tk.Frame(self.tab_calc, pady=5)
-        frame_top.pack(fill=tk.X, padx=10)
-        self.work_combo = ttk.Combobox(frame_top, width=120)
-        self.work_combo.pack(side=tk.LEFT, padx=5)
-        self.work_combo.bind('<KeyRelease>', self.filter_works_combo)
-        self.update_combobox()
-        tk.Label(frame_top, text="Объём:").pack(side=tk.LEFT)
-        self.vol_entry = tk.Entry(frame_top, width=10)
-        add_clipboard_support(self.vol_entry)
-        add_context_menu(self.vol_entry)
-        self.vol_entry.pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_top, text="Добавить работу", bg="#2196F3", fg="white",
-                  command=self.add_to_estimate).pack(side=tk.LEFT, padx=10)
-        frame_tools = tk.Frame(self.tab_calc, pady=5)
-        frame_tools.pack(fill=tk.X, padx=10)
-        tk.Button(frame_tools, text="💾 Черновик", bg="#795548", fg="white",
-                  command=self._manual_save_draft).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_tools, text="➕ Раздел", bg="#9C27B0", fg="white",
-                  command=self.add_section).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_tools, text="➕ Материал", bg="#4CAF50", fg="white",
-                  command=self.add_material_to_selected).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_tools, text="📋 Дубль мат.", bg="#FF9800", fg="white",
-                  command=self.duplicate_material).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_tools, text=" Удалить", bg="#f44336", fg="white",
-                  command=self.remove_smeta_row).pack(side=tk.LEFT, padx=5)
-        self.calc_cols = sc.CALC_HEADERS
-
-        calc_tree_frame = tk.Frame(self.tab_calc)
-        calc_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        style = ttk.Style()
-        style.configure("Smeta.Treeview", rowheight=30)
-        self.tree_smeta = ttk.Treeview(
-            calc_tree_frame, 
-            columns=self.calc_cols, 
-            show='headings', 
-            selectmode='extended',
-            style="Smeta.Treeview"
+    def get_values(self):
+        return (
+            self.folder_edit.text().strip(),
+            self.name_edit.text().strip(),
         )
-        
-        widths = {"№": 45, "Наименование": 380, "Ед. изм.": 65}
-        
-        for c in self.calc_cols:
-            self.tree_smeta.heading(c, text=c)
-            self.tree_smeta.column(c, width=widths.get(c, 90),
-                                    anchor="w" if c == "Наименование" else "center")
-        calc_yscroll = ttk.Scrollbar(calc_tree_frame, orient="vertical", command=self.tree_smeta.yview)
-        self.tree_smeta.configure(yscrollcommand=calc_yscroll.set)
-        self.tree_smeta.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        calc_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree_smeta.tag_configure("section", background="#E1BEE7", font=("Arial", 10, "bold"))
-        self.tree_smeta.bind("<Double-1>", self.on_tree_double_click)
-       
-        def handle_undo(event):
-            if event.keycode == 90 and (event.state & 0x4 or event.state & 0x10):
-                self.undo_action(event)
-                return "break"
 
-        self.tree_smeta.bind("<Control-Key>", handle_undo, add="+")
-        self.tree_smeta.bind("<Command-Key>", handle_undo, add="+")
-        self.tree_smeta.bind("<Button-3>", self._show_context_menu)
-        self._tooltip_win = None
-        self.tree_smeta.bind("<Motion>", self._show_name_tooltip)
-        self.tree_smeta.bind("<Leave>", self._hide_tooltip)
-        frame_bottom = tk.Frame(self.tab_calc, pady=5)
-        frame_bottom.pack(fill=tk.X, padx=10)
-        tk.Button(frame_bottom, text="📂 Загрузить смету", bg="#607D8B", fg="white",
-                  command=self.load_estimate).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_bottom, text="💾 Сохранить черновик", bg="#795548", fg="white",
-                  command=self._manual_save_draft).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_bottom, text="Выгрузить в Excel", bg="#FF9800", fg="white",
-                  command=self.export_excel).pack(side=tk.LEFT, padx=5)
-        frame_extra = tk.LabelFrame(self.tab_calc, text="Доп. расходы (учитываются в ИТОГО)", padx=8, pady=4)
-        frame_extra.pack(fill=tk.X, padx=10, pady=3)
-        self.extra_entries = {}
-        specs = [
-            ("Накладные/транспортные, В1: ", "overhead1"), ("В2: ", "overhead2"),
-            ("   Подъёмные механизмы, В1: ", "lift1"), ("В2: ", "lift2"),
-            ("   Вывоз мусора, В1: ", "trash1"), ("В2: ", "trash2"),
-        ]
-        for label, key in specs:
-            tk.Label(frame_extra, text=label).pack(side=tk.LEFT, padx=(4, 2))
-            en = tk.Entry(frame_extra, width=12)
-            add_clipboard_support(en)
-            add_context_menu(en)
-            en.insert(0, "0")
-            en.pack(side=tk.LEFT, padx=2)
-            en.bind('<KeyRelease>', lambda e: self.update_total_sum())
-            self.extra_entries[key] = en
-        total_frame = tk.Frame(self.tab_calc)
-        total_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
-        tk.Label(total_frame, text=" ").pack(side=tk.LEFT, expand=True)
-        self.total_label = tk.Label(total_frame, text="ИТОГО В1: 0.00 ₽   |   ИТОГО В2: 0.00 ₽   |   Экономия: 0.00 ₽ (0.0%)", font=("Arial", 13, "bold"), fg="#1565C0")
-        self.total_label.pack(side=tk.RIGHT)
 
-    def _gather_rows(self):
-        """Собирает все строки из дерева сметы в список кортежей.
-        
-        Returns:
-            list: список значений строк (кортежи).
-        """
-        return [self.tree_smeta.item(it, 'values') for it in self.tree_smeta.get_children()]
+# ---------------------------------------------------------------------------
+# Диалог настроек
+# ---------------------------------------------------------------------------
+class SettingsDialog(QDialog):
+    """Диалог настроек приложения."""
 
-    def full_rebuild(self):
-        """Полностью пересчитывает смету: пересчёт объёмов, стоимостей, итогов.
-        
-        Пересоздаёт все строки на основе текущих данных с учётом норм расхода
-        и объёмов работ.
-        """
-        rows = self._gather_rows()
-        rebuilt = sc.rebuild_smeta(rows)
-        self.tree_smeta.delete(*self.tree_smeta.get_children())
-        for vals in rebuilt:
-            tags = ("section",) if sc.is_section(str(vals[1])) else ()
-            self.tree_smeta.insert("", tk.END, values=vals, tags=tags)
-        self.update_total_sum()
-        self._save_draft()  # автосохранение черновика
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки")
+        self.setFixedSize(450, 280)
 
-    def add_section(self):
-        """Добавляет новый раздел в смету."""
-        self.tree_smeta.insert("", tk.END, values=("", f"{sc.SECTION_PREFIX}Новый раздел", "", "", "", "", "", "", "", "", ""), tags=("section",))
+        folder_w = QLineEdit()
+        export_w = QLineEdit()
+        koeff_w = QDoubleSpinBox()
+        koeff_w.setRange(0.1, 3.0)
+        koeff_w.setDecimals(3)
+        koeff_w.setValue(1.0)
 
-    def _editable_cols_for(self, name_raw):
-        """Возвращает индексы редактируемых колонок для строки.
-        
-        Args:
-            name_raw (str): текст названия строки (с префиксом или без).
-            
-        Returns:
-            set: множество индексов колонок, которые можно редактировать.
-        """
-        name_raw = str(name_raw).strip()
-        if sc.is_work(name_raw):
-            return {1, 4, 5, 9}
-        if sc.is_material(name_raw):
-            return {1, 3, 5, 7, 9}
-        return set()
+        btn_browse_folder = QPushButton("...")
+        btn_browse_export = QPushButton("...")
 
-    def on_tree_double_click(self, event):
-        """Обработчик двойного клика по строке сметы — начинает редактирование ячейки.
-        
-        Args:
-            event: событие мыши с координатами клика.
-        """
-        item = self.tree_smeta.identify_row(event.y)
-        if not item:
-            return
-        col = self.tree_smeta.identify_column(event.x)
-        if not col or col == '#0':
-            return
-        col_idx = int(col[1:]) - 1
-        vals = self.tree_smeta.item(item, 'values')
-        if not vals:
-            return
-        name_raw = str(vals[1]).strip()
-        if sc.is_section(name_raw) and col_idx == 1:
-            self._edit_section_inline(item, vals)
-            return
-        if col_idx in self._editable_cols_for(name_raw):
-            self._start_cell_edit(item, vals, col_idx)
+        def on_browse_folder():
+            d = QFileDialog.getExistingDirectory(self, "Папка базы данных")
+            if d:
+                folder_w.setText(d)
 
-    def add_to_estimate(self):
-        """Добавляет выбранную работу в смету с указанным объёмом."""
-        display_text = self.work_combo.get().strip()
-        if not display_text:
-            return messagebox.showwarning("Внимание", "Выберите работу из списка.")
-        # Извлекаем чистое название работы
-        work_name = self._extract_work_name(display_text)
-        raw = self.vol_entry.get().strip()
-        try:
-            vol = float(raw.replace(',', '.'))
-        except ValueError:
-            return messagebox.showerror("Ошибка", "Введите корректное число в поле «Объём».")
-        self._add_work_to_smeta(work_name, vol)
+        def on_browse_export():
+            d = QFileDialog.getExistingDirectory(self, "Папка экспорта смет")
+            if d:
+                export_w.setText(d)
 
-    def _add_work_to_smeta(self, work_name, volume, suppress_total_update=False):
-        """Добавляет блок работы с материалами в смету.
-        
-        Args:
-            work_name (str): название работы из справочника.
-            volume (float): объём работы.
-            suppress_total_update (bool): если True, не обновляет итоги (для пакетного добавления).
-        """
-        rows = self._gather_rows()
-        next_num = 1
-        for vals in rows:
-            if vals and str(vals[0]).strip().isdigit():
-                next_num = max(next_num, int(vals[0]) + 1)
-        block = sc.build_work_block(work_name, volume, self.db, next_num, self.db_manager)
-        if block is None:
-            return messagebox.showwarning("Внимание", f"Работа «{work_name}» не найдена в базе!")
-        for vals in block:
-            self.tree_smeta.insert("", tk.END, values=vals)
-        if not suppress_total_update:
-            self.update_total_sum()
-        self._save_draft()  # автосохранение черновика
+        btn_browse_folder.clicked.connect(on_browse_folder)
+        btn_browse_export.clicked.connect(on_browse_export)
 
-    def remove_smeta_row(self):
-        """Удаляет выбранные строки из сметы и пересчитывает итоги."""
-        selected = self.tree_smeta.selection()
-        if not selected:
-            return
-        for item in selected:
-            vals = self.tree_smeta.item(item, 'values')
-            if vals and sc.is_total(str(vals[1])):
-                return messagebox.showwarning("Внимание", "Нельзя удалить итоговую строку напрямую.\nДля удаления узла целиком удалите строку с работой.")
-        for item in selected:
-            self.tree_smeta.delete(item)
-        self.full_rebuild()
-        self._save_draft()  # автосохранение черновика
+        row_folder = QHBoxLayout()
+        row_folder.addWidget(QLabel("Папка базы данных:"))
+        row_folder.addWidget(folder_w)
+        row_folder.addWidget(btn_browse_folder)
 
-    def update_total_sum(self):
-        """Пересчитывает и обновляет итоговую сумму сметы на экране."""
-        rows = self._gather_rows()
-        t1, t2 = sc.compute_grand_totals(rows)
-        oh1 = sc.to_float(self.extra_entries['overhead1'].get())
-        oh2 = sc.to_float(self.extra_entries['overhead2'].get())
-        l1 = sc.to_float(self.extra_entries['lift1'].get())
-        l2 = sc.to_float(self.extra_entries['lift2'].get())
-        tr1 = sc.to_float(self.extra_entries['trash1'].get())
-        tr2 = sc.to_float(self.extra_entries['trash2'].get())
-        grand1 = round(t1 + oh1 + l1 + tr1, 2)
-        grand2 = round(t2 + oh2 + l2 + tr2, 2)
-        saving = round(grand1 - grand2, 2)
-        pct = (saving / grand1 * 100.0) if grand1 else 0.0
-        def fmt(v):
-            return format(v, ',.2f').replace(',', ' ')
-        self.total_label.config(
-            text=f"ИТОГО В1: {fmt(grand1)} ₽   |   ИТОГО В2: {fmt(grand2)} ₽   |   "
-                 f"Экономия: {fmt(saving)} ₽ ({pct:.1f}%)"
+        row_export = QHBoxLayout()
+        row_export.addWidget(QLabel("Папка экспорта:"))
+        row_export.addWidget(export_w)
+        row_export.addWidget(btn_browse_export)
+
+        row_koeff = QHBoxLayout()
+        row_koeff.addWidget(QLabel("Коэффициент В1 от В2:"))
+        row_koeff.addWidget(koeff_w)
+
+        btn_save = QPushButton("Сохранить")
+        btn_cancel = QPushButton("Отмена")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+        row_btn = QHBoxLayout()
+        row_btn.addWidget(btn_save)
+        row_btn.addWidget(btn_cancel)
+
+        layout = QVBoxLayout()
+        layout.addLayout(row_folder)
+        layout.addLayout(row_export)
+        layout.addLayout(row_koeff)
+        layout.addStretch()
+        layout.addLayout(row_btn)
+        self.setLayout(layout)
+
+        self.folder_edit = folder_w
+        self.export_edit = export_w
+        self.koeff_spin = koeff_w
+
+    def get_values(self):
+        return (
+            self.folder_edit.text().strip(),
+            self.export_edit.text().strip(),
+            self.koeff_spin.value(),
         )
-        self.root.update_idletasks()
 
-    def _edit_section_inline(self, item, vals):
-        """Начинает редактирование названия раздела прямо в дереве.
-        
-        Args:
-            item: идентификатор строки в Treeview.
-            vals: значения строки.
-        """
-        bbox = self.tree_smeta.bbox(item, column='#2')
-        if not bbox:
+
+# ---------------------------------------------------------------------------
+# Диалог управления разделами
+# ---------------------------------------------------------------------------
+class SectionDialog(QDialog):
+    """Диалог для управления разделами сметы."""
+
+    def __init__(self, sections, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Разделы сметы")
+        self.setMinimumSize(400, 300)
+        self.sections = list(sections)
+
+        layout = QVBoxLayout()
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Название нового раздела")
+        form.addRow("Название:", self.name_edit)
+
+        btn_add = QPushButton("Добавить раздел")
+        btn_add.clicked.connect(self._add_section)
+        form.addRow("", btn_add)
+        layout.addLayout(form)
+
+        self.list_widget = QTableWidget()
+        self.list_widget.setColumnCount(2)
+        self.list_widget.setHorizontalHeaderLabels(["№", "Название"])
+        self.list_widget.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._refresh_list()
+        layout.addWidget(self.list_widget)
+
+        btn_remove = QPushButton("Удалить выбранный")
+        btn_remove.clicked.connect(self._remove_selected)
+        btn_ok = QPushButton("OK")
+        btn_cancel = QPushButton("Отмена")
+        btn_ok.setDefault(True)
+
+        row_btn = QHBoxLayout()
+        row_btn.addWidget(btn_remove)
+        row_btn.addStretch()
+        row_btn.addWidget(btn_cancel)
+        row_btn.addWidget(btn_ok)
+        layout.addLayout(row_btn)
+
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        self.setLayout(layout)
+
+    def _refresh_list(self):
+        self.list_widget.setRowCount(len(self.sections))
+        for i, sec in enumerate(self.sections):
+            self.list_widget.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self.list_widget.setItem(i, 1, QTableWidgetItem(sec))
+
+    def _add_section(self):
+        name = self.name_edit.text().strip()
+        if not name:
             return
-        x, y, w, h = bbox
-        root_x = self.tree_smeta.winfo_rootx() - self.root.winfo_rootx()
-        root_y = self.tree_smeta.winfo_rooty() - self.root.winfo_rooty()
-        self.edit_entry = tk.Entry(self.root, font=("Arial", 10), bd=1, relief="solid")
-        self.edit_entry.place(x=root_x + x, y=root_y + y, width=w, height=h)
-        add_clipboard_support(self.edit_entry)
-        add_context_menu(self.edit_entry)
-        self.edit_entry.insert(0, vals[1].replace(sc.SECTION_PREFIX, ""))
-        self.edit_entry.focus()
-        self.edit_entry.select_range(0, tk.END)
-        self.edit_item, self.edit_orig, self.edit_col_idx = item, list(vals), 1
-        self.edit_entry.bind("<Return>", lambda e: self._save_section_edit())
-        self.edit_entry.bind("<Escape>", lambda e: self._destroy_edit())
-        self.edit_entry.bind("<FocusOut>", lambda e: self.root.after(100, self._save_section_edit))
-
-    def _save_section_edit(self):
-        """Завершает редактирование названия раздела и обновляет дерево."""
-        if self.edit_entry is None or not self.edit_entry.winfo_exists():
+        if name in self.sections:
+            QMessageBox.warning(self, "Ошибка", "Раздел уже существует.")
             return
-        nm = self.edit_entry.get().strip()
-        if nm:
-            nv = self.edit_orig[:]
-            nv[1] = f"{sc.SECTION_PREFIX}{nm}"
-            self.tree_smeta.item(self.edit_item, values=tuple(nv))
-        self._destroy_edit()
+        self.sections.append(name)
+        self.name_edit.clear()
+        self._refresh_list()
 
-    def _start_cell_edit(self, item, vals, col_idx):
-        """Начинает редактирование ячейки в дереве сметы.
-        
-        Args:
-            item: идентификатор строки в Treeview.
-            vals: значения строки.
-            col_idx (int): индекс редактируемой колонки.
-        """
-        self.undo_stack.append((item, col_idx, vals[col_idx]))
-        ct = f'#{col_idx + 1}'
-        bbox = self.tree_smeta.bbox(item, column=ct)
-        if not bbox:
-            return
-        x, y, w, h = bbox
-        root_x = self.tree_smeta.winfo_rootx() - self.root.winfo_rootx()
-        root_y = self.tree_smeta.winfo_rooty() - self.root.winfo_rooty()
-        self.edit_entry = tk.Entry(self.root, font=("Arial", 10), bd=1, relief="solid")
-        self.edit_entry.place(x=root_x + x, y=root_y + y, width=w, height=h)
-        add_clipboard_support(self.edit_entry)
-        add_context_menu(self.edit_entry)
-        self.edit_entry.insert(0, str(vals[col_idx]))
-        self.edit_entry.focus()
-        self.edit_entry.select_range(0, tk.END)
-        self.edit_item, self.edit_orig, self.edit_col_idx = item, list(vals), col_idx
-        self.edit_entry.bind("<Return>", lambda e: self._finish_cell_edit())
-        self.edit_entry.bind("<Escape>", lambda e: self._destroy_edit())
-        self.edit_entry.bind("<FocusOut>", lambda e: self.root.after(100, self._finish_cell_edit))
-
-    def _finish_cell_edit(self):
-        """Завершает редактирование ячейки и применяет изменения."""
-        if self.edit_entry is None or not self.edit_entry.winfo_exists():
-            return
-        nv = self.edit_entry.get().strip()
-        if nv == "":
-            return self._destroy_edit()
-        nvals = self.edit_orig[:]
-        numeric_cols = {3, 4, 5, 7, 9}
-        if self.edit_col_idx in numeric_cols:
-            try:
-                nvals[self.edit_col_idx] = float(nv.replace(',', '.'))
-            except ValueError:
-                messagebox.showerror("Ошибка", "Введите корректное число.")
-                self.edit_entry.focus()
-                return
-        else:
-            nvals[self.edit_col_idx] = nv
-        if self.edit_col_idx == 1:
-            orig = str(self.edit_orig[1]).strip()
-            clean = str(nvals[1]).replace(sc.WORK_PREFIX, "").replace(sc.MATERIAL_PREFIX, "").strip()
-            if orig.startswith(sc.MATERIAL_PREFIX):
-                nvals[1] = f"{sc.MATERIAL_PREFIX}{clean}"
-            elif orig.startswith(sc.WORK_PREFIX):
-                nvals[1] = f"{sc.WORK_PREFIX}{clean}"
-        self.tree_smeta.item(self.edit_item, values=tuple(nvals))
-        self._sync_db(nvals, self.edit_col_idx)
-        self._propagate_same_name(nvals, self.edit_col_idx)
-        try:
-            self.full_rebuild()
-        except Exception as e:
-            messagebox.showerror("Ошибка пересчёта", f"Не удалось обновить итоги:\n{e}")
-        finally:
-            self._destroy_edit()
-
-    def _propagate_same_name(self, nvals, col_idx):
-        """Применяет изменение ко всем строкам с таким же названием работы/материала.
-        
-        При изменении цены или нормы для работы/материала, все другие строки
-        с таким же именем получают это же значение.
-        
-        Args:
-            nvals: обновлённые значения строки.
-            col_idx (int): индекс изменённой колонки.
-        """
-        if col_idx not in (3, 5, 7, 9):
-            return
-        orig_name = str(self.edit_orig[1]).strip()
-        # ✅ Исправлено: используем is_work/is_material вместо прямой проверки префикса
-        # (strip() убирает пробелы из MATERIAL_PREFIX="    >", поэтому startswith не сработает)
-        is_work_row = sc.is_work(orig_name)
-        is_mat_row = sc.is_material(orig_name)
-        if not (is_work_row or is_mat_row):
-            return
-        clean = sc.clean_name(orig_name)
-        new_val = nvals[col_idx]
-        for item in self.tree_smeta.get_children():
-            if item == self.edit_item:
-                continue
-            vals = list(self.tree_smeta.item(item, 'values'))
-            v_name = str(vals[1]).strip()
-            # ✅ Исправлено: используем is_work/is_material для проверки типа
-            same_type = (is_work_row and sc.is_work(v_name)) or (is_mat_row and sc.is_material(v_name))
-            if not same_type:
-                continue
-            if sc.clean_name(v_name) == clean:
-                vals[col_idx] = new_val
-                self.tree_smeta.item(item, values=tuple(vals))
-
-    def _sync_db(self, nv, col_idx):
-        """Синхронизирует изменения в смете с базой данных.
-        
-        При изменении цены или нормы в смете, обновляет соответствующие
-        записи в SQLite-базе.
-        
-        Args:
-            nv: новые значения строки.
-            col_idx (int): индекс изменённой колонки.
-        """
-        ov = str(self.edit_orig[1]).strip()
-        is_work_row = ov.startswith(sc.WORK_PREFIX)
-        is_mat_row = ov.startswith(sc.MATERIAL_PREFIX)
-        clean = sc.clean_name(ov)
-        col_map_mat = {3: 'consumption_1', 5: 'price_1', 7: 'consumption_2', 9: 'price_2'}
-        col_map_work = {5: 'price_1', 9: 'price_2'}
-        try:
-            if self.db_manager is None:
-                return
-            if col_idx == 1:
-                nc = str(nv[1]).replace(sc.WORK_PREFIX, "").replace(sc.MATERIAL_PREFIX, "").strip()
-                if is_work_row:
-                    self.db_manager.works_cache.loc[self.db_manager.works_cache['name'].str.strip() == clean, 'name'] = nc
-                elif is_mat_row:
-                    self.db_manager.materials_cache.loc[self.db_manager.materials_cache['name'].str.strip() == clean, 'name'] = nc
-                self.db_manager.works_dirty = True
-                self.db_manager.materials_dirty = True
-            elif is_mat_row and col_idx in col_map_mat:
-                mat = self.db_manager.get_material_by_name(clean)
-                if mat is not None:
-                    self.db_manager.work_materials_cache.loc[self.db_manager.work_materials_cache['material_id'] == mat['id'], col_map_mat[col_idx]] = sc.to_float(nv[col_idx])
-                    self.db_manager.work_materials_dirty = True
-            elif is_work_row and col_idx in col_map_work:
-                self.db_manager.works_cache.loc[self.db_manager.works_cache['name'].str.strip() == clean, col_map_work[col_idx]] = sc.to_float(nv[col_idx])
-                self.db_manager.works_dirty = True
-            else:
-                return
-            self.db_manager.flush()
-            self.refresh_db_table()
-            self.update_combobox()
-        except Exception as e:
-            messagebox.showerror("Ошибка БД", str(e))
-
-    def _destroy_edit(self):
-        """Уничтожает поле редактирования и сбрасывает переменные состояния."""
-        if self.edit_entry is not None and self.edit_entry.winfo_exists():
-            self.edit_entry.destroy()
-        self.edit_entry = None
-        self.edit_item = None
-        self.edit_col_idx = None
-        self.edit_orig = None
-
-    def _show_name_tooltip(self, event):
-        """Показывает всплывающую подсказку с полным названием строки.
-        
-        Если название строки длиннее 45 символов, показывает полное значение
-        во всплывающем окне при наведении курсора.
-        
-        Args:
-            event: событие движения мыши.
-        """
-        item = self.tree_smeta.identify_row(event.y)
-        col = self.tree_smeta.identify_column(event.x)
-        if not item or col != '#2':
-            self._hide_tooltip()
-            return
-        vals = self.tree_smeta.item(item, 'values')
-        if not vals:
-            self._hide_tooltip()
-            return
-        text = str(vals[1])
-        if len(text) <= 45:
-            self._hide_tooltip()
-            return
-        self._hide_tooltip()
-        self._tooltip_win = tk.Toplevel(self.root)
-        self._tooltip_win.wm_overrideredirect(True)
-        self._tooltip_win.wm_geometry(f"+{event.x_root+15}+{event.y_root+15}")
-        self._tooltip_win.attributes("-topmost", True)
-        tk.Label(
-            self._tooltip_win, 
-            text=text, 
-            background="#ffffdd", 
-            relief="solid", 
-            borderwidth=1,
-            wraplength=500, 
-            justify="left", 
-            font=("Arial", 11),
-            padx=8, pady=4
-        ).pack()
-
-    def _hide_tooltip(self, event=None):
-        """Скрывает всплывающую подсказку."""
-        if hasattr(self, '_tooltip_win') and self._tooltip_win is not None:
-            try:
-                self._tooltip_win.destroy()
-            except tk.TclError:
-                pass
-            finally:
-                self._tooltip_win = None
-
-    def _open_material_dialog(self, initial_data=None):
-        """Открывает диалог для добавления нового материала.
-        
-        Args:
-            initial_data (dict, optional): начальные данные для предзаполнения полей.
-            
-        Returns:
-            dict or None: словарь с данными материала или None при отмене.
-        """
-        win = tk.Toplevel(self.root)
-        win.title("Добавить материал")
-        win.resizable(False, False)
-        win.transient(self.root)
-        win.grab_set()
-        result = {}
-        entries = {}
-        fields = [("Наименование: ", "name", 30), ("Ед. изм.: ", "unit", 12), ("Норма расхода (В1): ", "norm1", 14), ("Цена за ед. (В1): ", "price1", 14), ("Норма расхода (В2): ", "norm2", 14), ("Цена за ед. (В2): ", "price2", 14)]
-        for i, (lbl, key, w) in enumerate(fields):
-            tk.Label(win, text=lbl).grid(row=i, column=0, padx=5, pady=4, sticky="e")
-            e = tk.Entry(win, width=w)
-            add_clipboard_support(e)
-            add_context_menu(e)
-            if initial_data and key in initial_data:
-                e.insert(0, str(initial_data[key]))
-            e.grid(row=i, column=1, padx=5, pady=4, sticky="w")
-            entries[key] = e
-        err_label = tk.Label(win, text=" ", fg="red")
-        err_label.grid(row=len(fields), column=0, columnspan=2)
-        def apply():
-            name = entries['name'].get().strip()
-            if not name:
-                err_label.config(text="Введите наименование материала.")
-                return
-            data = {'name': name, 'unit': entries['unit'].get().strip()}
-            for key in ('norm1', 'price1', 'norm2', 'price2'):
-                raw = entries[key].get().strip()
-                if raw == "" or raw == "-":
-                    data[key] = 0.0
-                    continue
-                try:
-                    data[key] = float(raw.replace(',', '.'))
-                except ValueError:
-                    err_label.config(text=f"Поле «{key}» должно быть числом.")
-                    return
-            result.update(data)
-            win.destroy()
-        def cancel():
-            result.clear()
-            win.destroy()
-        btn_f = tk.Frame(win)
-        btn_f.grid(row=len(fields) + 1, column=0, columnspan=2, pady=10)
-        tk.Button(btn_f, text="Добавить", bg="#4CAF50", fg="white", command=apply).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_f, text="Отмена", command=cancel).pack(side=tk.LEFT, padx=5)
-        win.bind("<Return>", lambda e: apply())
-        win.wait_window()
-        return result if result else None
-
-    def add_material_to_selected(self):
-        """Добавляет новый материал в смету после выбранной строки."""
-        sel = self.tree_smeta.selection()
-        if not sel:
-            return messagebox.showwarning("Внимание", "Выберите работу или материал.")
-        item = sel[0]
-        vals = self.tree_smeta.item(item, 'values')
-        name_raw = str(vals[1]).strip()
-        if sc.is_section(name_raw):
-            return messagebox.showwarning("Внимание", "Нельзя добавить материал в раздел. Выберите работу.")
-        if sc.is_total(name_raw):
-            return messagebox.showwarning("Внимание", "Выберите строку работы или материала, не итоговую строку.")
-        children = list(self.tree_smeta.get_children())
-        insert_idx = children.index(item) + 1
-        data = self._open_material_dialog()
-        if not data or not data.get('name'):
-            return
-        self.tree_smeta.insert("", insert_idx, values=("", f"{sc.MATERIAL_PREFIX}{data['name']}", data['unit'], data['norm1'], "", data['price1'], "", data['norm2'], "", data['price2'], ""))
-        self.full_rebuild()
-
-    def duplicate_material(self):
-        """Дублирует выбранную строку материала."""
-        sel = self.tree_smeta.selection()
-        if not sel:
-            return messagebox.showwarning("Внимание", "Выберите строку материала.")
-        item = sel[0]
-        vals = list(self.tree_smeta.item(item, 'values'))
-        name_raw = str(vals[1]).strip()
-        if not sc.is_material(name_raw):
-            return messagebox.showwarning("Внимание", "Выбрана не строка материала.")
-        children = list(self.tree_smeta.get_children())
-        insert_idx = children.index(item) + 1
-        self.tree_smeta.insert("", insert_idx, values=tuple(vals))
-        self.full_rebuild()
-
-    def load_estimate(self):
-        """Загружает смету из Excel-файла.
-        
-        Читает лист «Смета» (данные) и «Meta» (метаданные). Предлагает
-        добавить новые записи из Meta в справочник.
-        """
-        file_path = filedialog.askopenfilename(title="Выберите файл сметы", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
-        if not file_path:
-            return
-        try:
-            xl = pd.ExcelFile(file_path)
-        except Exception as e:
-            return messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
-        meta_df = None
-        if "Meta" in xl.sheet_names:
-            meta_df = pd.read_excel(xl, sheet_name="Meta")
-        else:
-            if not messagebox.askyesno("Предупреждение", "В файле отсутствует служебный лист Meta.\nВосстановление сметы может быть неполным.\nПродолжить?"):
-                return
-        if "Смета" not in xl.sheet_names:
-            return messagebox.showerror("Ошибка", "В файле отсутствует лист 'Смета'.")
-        smeta_df = pd.read_excel(xl, sheet_name="Смета", header=None)
-        if meta_df is not None and not meta_df.empty:
-            self._reconcile_meta(meta_df)
-        res = sc.parse_exported_sheet(smeta_df.values.tolist())
-        self.tree_smeta.delete(*self.tree_smeta.get_children())
-        self.title_entry.delete(0, tk.END)
-        if res['title']:
-            self.title_entry.insert(0, res['title'])
-        missing = []
-        for entry in res['sequence']:
-            if entry[0] == 'section':
-                self.tree_smeta.insert("", tk.END, values=("", f"{sc.SECTION_PREFIX}{entry[1]}", "", "", "", "", "", "", "", "", ""), tags=("section",))
-            else:
-                _, name, vol = entry
-                clean_name = sc.clean_name(name)
-                if (self.db['Работа'].astype(str).str.strip() == clean_name).any():
-                    self._add_work_to_smeta(clean_name, vol, suppress_total_update=True)
-                else:
-                    missing.append(clean_name)
-        oh1, oh2 = res['overhead']
-        l1, l2 = res['lifting']
-        lt1, lt2 = res.get('lifting_trash', (0.0, 0.0))
-        for key, val in (('overhead1', oh1), ('overhead2', oh2), 
-                         ('lift1', l1), ('lift2', l2), 
-                         ('trash1', lt1), ('trash2', lt2)):
-            self.extra_entries[key].delete(0, tk.END)
-            self.extra_entries[key].insert(0, str(val))
-        self.full_rebuild()
-        if missing:
-            messagebox.showwarning("Внимание", "Не найдены в справочнике и не были восстановлены работы:\n" + "\n".join(missing))
-        messagebox.showinfo("Готово", "Смета загружена.")
-
-    def _reconcile_meta(self, meta_df):
-        """Сравнивает метаданные из сметы с текущим справочником.
-        
-        Ищет записи, которые есть в Meta, но отсутствуют в базе, или
-        имеют другие значения. Предлагает добавить их в справочник.
-        
-        Args:
-            meta_df (pd.DataFrame): DataFrame с метаданными из файла сметы.
-        """
-        for col in sc.COLS:
-            if col not in meta_df.columns:
-                meta_df[col] = "-" if col in ('Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм') else 0.0
-        numeric_cols = ('Расход_1', 'Цена_мат_1', 'Цена_раб_1', 'Расход_2', 'Цена_мат_2', 'Цена_раб_2')
-        new_rows_list = []
-        for _, meta_row in meta_df.iterrows():
-            work = str(meta_row['Работа']).strip()
-            material = str(meta_row['Материал']).strip()
-            existing = self.db[(self.db['Работа'].astype(str).str.strip() == work) & (self.db['Материал'].astype(str).str.strip() == material)]
-            if existing.empty:
-                new_rows_list.append(meta_row)
-                continue
-            match_found = False
-            for _, exist_row in existing.iterrows():
-                try:
-                    ok = (str(exist_row['Ед_изм_раб']).strip() == str(meta_row['Ед_изм_раб']).strip() and str(exist_row['Ед_изм']).strip() == str(meta_row['Ед_изм']).strip())
-                    for nc in numeric_cols:
-                        ok = ok and abs(sc.to_float(exist_row[nc]) - sc.to_float(meta_row[nc])) < 1e-6
-                    if ok:
-                        match_found = True
-                        break
-                except Exception:
-                    continue
-            if not match_found:
-                new_rows_list.append(meta_row)
-        if new_rows_list:
-            if messagebox.askyesno("Новые данные", f"В смете найдено {len(new_rows_list)} новых или изменённых записей.\nДобавить их в справочник?"):
-                new_rows_df = pd.DataFrame(new_rows_list)
-                for nc in numeric_cols:
-                    if nc in new_rows_df.columns:
-                        new_rows_df[nc] = pd.to_numeric(new_rows_df[nc], errors='coerce').fillna(0.0)
-                if self.db_manager:
-                    self.db_manager.save_legacy_dataframe(new_rows_df)
-                    self.db = self.db_manager.get_legacy_dataframe()
-                else:
-                    self.db = pd.concat([self.db, new_rows_df[sc.COLS]], ignore_index=True)
-                    os.makedirs(self.db_folder, exist_ok=True)
-                    self.db.to_excel(self.db_file, index=False)
-                self.refresh_db_table()
-                self.update_combobox()
-                messagebox.showinfo("Готово", "Новые записи добавлены в справочник.")
-        else:
-            messagebox.showinfo("Информация", "Все записи из сметы уже присутствуют в справочнике.")
-
-    def export_excel(self):
-        """Выгружает текущую смету в Excel-файл с формулами и форматированием.
-        
-        Создаёт файл с двумя листами: «Смета» (данные) и «Meta» (метаданные
-        для восстановления). Включает накладные расходы, подъёмные механизмы,
-        вывоз мусора.
-        """
-        rows = self._gather_rows()
+    def _remove_selected(self):
+        rows = self.list_widget.selectionModel().selectedRows()
         if not rows:
-            return messagebox.showwarning("Внимание", "Смета пуста — нечего выгружать.")
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            export_path = os.path.join(self.export_folder, f"Smeta_{timestamp}.xlsx")
-            os.makedirs(self.export_folder, exist_ok=True)
-            
-            # ✅ Формируем meta_rows из данных сметы (работы + материалы)
-            meta_rows = []
-            seen = set()
-            current_work = None
-            
-            for vals in rows:
-                name = str(vals[1]).strip()
-                if sc.is_work(name):
-                    current_work = sc.clean_name(name)
-                elif sc.is_material(name) and current_work:
-                    clean_mat = sc.clean_name(name)
-                    key = (current_work, clean_mat)
-                    if key not in seen:
-                        seen.add(key)
-                        meta_rows.append([
-                            current_work,
-                            "",  # Ед_изм_раб
-                            clean_mat,
-                            str(vals[2]),  # Ед_изм
-                            vals[3],  # Расход_1
-                            vals[5],  # Цена_мат_1
-                            "",  # Цена_раб_1
-                            vals[7],  # Расход_2
-                            vals[9],  # Цена_мат_2
-                            ""   # Цена_раб_2
-                        ])
-            title = self.title_entry.get().strip()
-            oh1 = sc.to_float(self.extra_entries['overhead1'].get())
-            oh2 = sc.to_float(self.extra_entries['overhead2'].get())
-            l1 = sc.to_float(self.extra_entries['lift1'].get())
-            l2 = sc.to_float(self.extra_entries['lift2'].get())
-            tr1 = sc.to_float(self.extra_entries['trash1'].get())
-            tr2 = sc.to_float(self.extra_entries['trash2'].get())
-            sc.export_smeta_to_excel(rows, export_path, title=title, meta_rows=meta_rows, 
-                                      overhead1=oh1, overhead2=oh2, lift1=l1, lift2=l2,
-                                      trash1=tr1, trash2=tr2)
-            messagebox.showinfo("Excel", f"Смета выгружена успешно!\nФайл: {export_path}")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось создать файл.\nЗакройте Excel и попробуйте снова.\n\n{e}")
-
-    def undo_action(self, event=None):
-        """Выполняет отмену последнего изменения в смете (Ctrl+Z)."""
-        if self.undo_stack:
-            item_id, col_idx, old_val = self.undo_stack.pop()
-            if self.tree_smeta.exists(item_id):
-                vals = list(self.tree_smeta.item(item_id, 'values'))
-                vals[col_idx] = old_val
-                self.tree_smeta.item(item_id, values=tuple(vals))
-                self.full_rebuild()
-
-    def _show_context_menu(self, event):
-        """Показывает контекстное меню для ячейки сметы (ПКМ)."""
-        self.ctx_menu_item = self.tree_smeta.identify_row(event.y)
-        self.ctx_menu_col = self.tree_smeta.identify_column(event.x)
-        if not self.ctx_menu_item or not self.ctx_menu_col:
             return
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Копировать значение", command=self._copy_cell)
-        menu.add_command(label="Вставить значение", command=self._paste_cell)
-        menu.tk_popup(event.x_root, event.y_root)
+        self.sections.pop(rows[0].row())
+        self._refresh_list()
+
+    def get_sections(self):
+        return self.sections
+
+
+# ---------------------------------------------------------------------------
+# Главное окно
+# ---------------------------------------------------------------------------
+class SmetaMainWindow(QMainWindow):
+    """Главное окно приложения «Сметчик PRO 5.2»."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Сметчик PRO 5.3")
+        self.resize(*WINDOW_SIZE)
+
+        # --- Состояние ---
+        self.db_folder = os.path.join(os.getcwd(), "db")
+        self.export_folder = os.path.join(os.getcwd(), "export")
+        self.koeff_price = 1.0
+        self.db_mgr = None
+
+        # Данные сметы
+        self.smeta_title = "Смета"
+        self.smeta_rows = []
+        self.extra_overhead1 = 0.0
+        self.extra_overhead2 = 0.0
+        self.extra_lifting1 = 0.0
+        self.extra_lifting2 = 0.0
+        self.extra_trash1 = 0.0
+        self.extra_trash2 = 0.0
+        self.sections = []
+        self.works_combo_list = []
+
+        # Undo-стек (простой список состояний)
+        self._undo_stack = []
+        self._redo_stack = []
+
+        # Копируемые значения
+        self.copied_value = None
+        self.copied_row = None
+
+        # --- БД ---
+        os.makedirs(self.db_folder, exist_ok=True)
+        self.db_mgr = DatabaseManager(self.db_folder, "smeta_db")
+
+        # --- Меню ---
+        self._create_menu()
+
+        # --- Центральный виджет ---
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
+
+        # --- Табы ---
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # --- Вкладка: Смета ---
+        self._create_smeta_tab()
+        self.tabs.addTab(self.smeta_tab, "Составление сметы")
+
+        # --- Вкладка: Справочник ---
+        self._create_reference_tab()
+        self.tabs.addTab(self.ref_tab, "Справочник")
+
+        # --- Статус-бар ---
+        self.statusBar().showMessage("Готово")
+
+        # --- Горячие клавиши ---
+        QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
+
+        # --- Загружаем черновик ---
+        self._load_draft()
+        self._refresh_works_combo()
+
+    # =======================================================================
+    # Меню
+    # =======================================================================
+    def _create_menu(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&Файл")
+
+        act = QAction("💾 &Сохранить черновик", self)
+        act.setShortcut(QKeySequence("Ctrl+S"))
+        act.triggered.connect(self._save_draft)
+        file_menu.addAction(act)
+
+        act = QAction("📤 &Экспорт в Excel", self)
+        act.setShortcut(QKeySequence("Ctrl+E"))
+        act.triggered.connect(self._export_to_excel)
+        file_menu.addAction(act)
+
+        act = QAction("📥 &Импорт из Excel", self)
+        act.setShortcut(QKeySequence("Ctrl+I"))
+        act.triggered.connect(self._import_from_excel)
+        file_menu.addAction(act)
+
+        file_menu.addSeparator()
+
+        act = QAction("Вы&ход", self)
+        act.setShortcut(QKeySequence("Ctrl+Q"))
+        act.triggered.connect(self.close)
+        file_menu.addAction(act)
+
+        edit_menu = menubar.addMenu("&Правка")
+
+        act = QAction("&Отменить (Ctrl+Z)", self)
+        act.setShortcut(QKeySequence.StandardKey.Undo)
+        act.triggered.connect(self._undo)
+        edit_menu.addAction(act)
+
+        act = QAction("Повторить (Ctrl+Y)", self)
+        act.setShortcut(QKeySequence("Ctrl+Y"))
+        act.triggered.connect(self._redo)
+        edit_menu.addAction(act)
+
+        edit_menu.addSeparator()
+
+        act = QAction("&Добавить работу", self)
+        act.setShortcut(QKeySequence("Ctrl+W"))
+        act.triggered.connect(self._add_work_row)
+        edit_menu.addAction(act)
+
+        act = QAction("Добавить &раздел", self)
+        act.setShortcut(QKeySequence("Ctrl+D"))
+        act.triggered.connect(self._show_section_dialog)
+        edit_menu.addAction(act)
+
+        edit_menu.addSeparator()
+
+        act = QAction("📖 &Справка", self)
+        act.setShortcut(QKeySequence("F1"))
+        act.triggered.connect(self._show_about)
+        edit_menu.addAction(act)
+
+        help_menu = menubar.addMenu("&Справка")
+        act = QAction("&О программе", self)
+        act.setShortcut(QKeySequence.StandardKey.HelpContents)
+        act.triggered.connect(self._show_about)
+        help_menu.addAction(act)
+
+    # =======================================================================
+    # Вкладка «Смета»
+    # =======================================================================
+    def _create_smeta_tab(self):
+        self.smeta_tab = QWidget()
+        layout = QVBoxLayout(self.smeta_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Верхняя панель
+        top_row = QHBoxLayout()
+        self.title_edit = QLineEdit()
+        self.title_edit.setText(self.smeta_title)
+        self.title_edit.setFixedWidth(350)
+        self.title_edit.textChanged.connect(self._on_title_changed)
+        top_row.addWidget(QLabel("Название сметы:"))
+        top_row.addWidget(self.title_edit)
+        top_row.addStretch()
+
+        self.btn_new_db = QPushButton("📁 Новая база")
+        self.btn_new_db.clicked.connect(self._show_new_database_dialog)
+        self.btn_new_db.setFixedWidth(130)
+
+        self.btn_sections = QPushButton("📑 Разделы")
+        self.btn_sections.clicked.connect(self._show_section_dialog)
+        self.btn_sections.setFixedWidth(100)
+
+        top_row.addWidget(self.btn_new_db)
+        top_row.addWidget(self.btn_sections)
+        layout.addLayout(top_row)
+
+        # Панель добавления работы
+        add_row = QHBoxLayout()
+        self.work_combo = QComboBox()
+        self.work_combo.setFixedWidth(350)
+        self.work_combo.setEditable(True)
+        self.work_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.work_combo.currentTextChanged.connect(self._on_work_combo_changed)
+
+        btn_add = QPushButton("➕ Добавить")
+        btn_add.clicked.connect(self._add_work_row)
+        btn_add.setFixedWidth(110)
+
+        self.vol_spin = QDoubleSpinBox()
+        self.vol_spin.setRange(0.001, 999999)
+        self.vol_spin.setDecimals(3)
+        self.vol_spin.setValue(1.0)
+        self.vol_spin.setFixedWidth(100)
+
+        self.price1_spin = QDoubleSpinBox()
+        self.price1_spin.setRange(0, 99999999)
+        self.price1_spin.setDecimals(2)
+        self.price1_spin.setFixedWidth(120)
+
+        self.price2_spin = QDoubleSpinBox()
+        self.price2_spin.setRange(0, 99999999)
+        self.price2_spin.setDecimals(2)
+        self.price2_spin.setFixedWidth(120)
+
+        add_row.addWidget(QLabel("Добавить работу:"))
+        add_row.addWidget(self.work_combo)
+        add_row.addWidget(btn_add)
+        add_row.addWidget(QLabel("Объём:"))
+        add_row.addWidget(self.vol_spin)
+        add_row.addWidget(QLabel("Цена В1:"))
+        add_row.addWidget(self.price1_spin)
+        add_row.addWidget(QLabel("Цена В2:"))
+        add_row.addWidget(self.price2_spin)
+        layout.addLayout(add_row)
+
+        # Таблица сметы
+        self.smeta_table = QTableWidget()
+        self.smeta_table.setColumnCount(len(CALC_HEADERS))
+        self.smeta_table.setHorizontalHeaderLabels(CALC_HEADERS)
+        self.smeta_table.setRowCount(0)
+        self.smeta_table.verticalHeader().setVisible(False)
+        self.smeta_table.setAlternatingRowColors(True)
+        self.smeta_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.smeta_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.smeta_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.smeta_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.smeta_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.smeta_table.horizontalHeader().setStretchLastSection(True)
+        self.smeta_table.cellDoubleClicked.connect(self._on_cell_double_click)
+        self.smeta_table.customContextMenuRequested.connect(self._show_table_context_menu)
+        layout.addWidget(self.smeta_table)
+
+        # Итоги
+        totals_widget = QWidget()
+        totals_layout = QHBoxLayout(totals_widget)
+        self.lbl_total1 = QLabel("Итого В1: 0.00 руб.")
+        self.lbl_total1.setFont(QFont(FONT_FAMILY, 11, QFont.Weight.Bold))
+        self.lbl_total2 = QLabel("Итого В2: 0.00 руб.")
+        self.lbl_total2.setFont(QFont(FONT_FAMILY, 11, QFont.Weight.Bold))
+        self.lbl_savings = QLabel("Экономия: 0.00 руб. (0.0%)")
+        self.lbl_savings.setFont(QFont(FONT_FAMILY, 10))
+        totals_layout.addWidget(self.lbl_total1)
+        totals_layout.addWidget(self.lbl_total2)
+        totals_layout.addWidget(self.lbl_savings)
+        totals_layout.addStretch()
+        layout.addWidget(totals_widget)
+
+        # Доп. расходы
+        exp_widget = QWidget()
+        exp_layout = QFormLayout(exp_widget)
+        self.overhead1_spin = QDoubleSpinBox(); self.overhead1_spin.setRange(0, 99999999); self.overhead1_spin.setDecimals(2)
+        self.overhead2_spin = QDoubleSpinBox(); self.overhead2_spin.setRange(0, 99999999); self.overhead2_spin.setDecimals(2)
+        self.lifting1_spin = QDoubleSpinBox(); self.lifting1_spin.setRange(0, 99999999); self.lifting1_spin.setDecimals(2)
+        self.lifting2_spin = QDoubleSpinBox(); self.lifting2_spin.setRange(0, 99999999); self.lifting2_spin.setDecimals(2)
+        self.trash1_spin = QDoubleSpinBox(); self.trash1_spin.setRange(0, 99999999); self.trash1_spin.setDecimals(2)
+        self.trash2_spin = QDoubleSpinBox(); self.trash2_spin.setRange(0, 99999999); self.trash2_spin.setDecimals(2)
+
+        exp_layout.addRow("Накладные (В1):", self.overhead1_spin)
+        exp_layout.addRow("Накладные (В2):", self.overhead2_spin)
+        exp_layout.addRow("Подъёмные (В1):", self.lifting1_spin)
+        exp_layout.addRow("Подъёмные (В2):", self.lifting2_spin)
+        exp_layout.addRow("Вывоз мусора (В1):", self.trash1_spin)
+        exp_layout.addRow("Вывоз мусора (В2):", self.trash2_spin)
+        layout.addWidget(exp_widget)
+
+        # Кнопки
+        btn_row = QHBoxLayout()
+        btn_save = QPushButton("💾 Сохранить"); btn_save.clicked.connect(self._save_draft)
+        btn_export = QPushButton("📤 Экспорт Excel"); btn_export.clicked.connect(self._export_to_excel)
+        btn_import = QPushButton("📥 Импорт Excel"); btn_import.clicked.connect(self._import_from_excel)
+        btn_recalc = QPushButton("🔄 Пересчитать"); btn_recalc.clicked.connect(self._recalc_smeta)
+        btn_clear = QPushButton("🗑 Очистить смету"); btn_clear.clicked.connect(self._clear_smeta)
+        btn_settings = QPushButton("⚙️ Настройки")
+        btn_settings.clicked.connect(self.show_settings)
+
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_export)
+        btn_row.addWidget(btn_import)
+        btn_row.addWidget(btn_recalc)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_settings)
+        btn_row.addWidget(btn_clear)
+        layout.addLayout(btn_row)
+
+        # Сигналы spinbox-ов
+        for sp in [self.overhead1_spin, self.overhead2_spin,
+                   self.lifting1_spin, self.lifting2_spin,
+                   self.trash1_spin, self.trash2_spin]:
+            sp.valueChanged.connect(self._on_extra_changed)
+
+    # =======================================================================
+    # Вкладка «Справочник»
+    # =======================================================================
+    def _create_reference_tab(self):
+        self.ref_tab = QWidget()
+        layout = QVBoxLayout(self.ref_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        self.ref_tabs = QTabWidget()
+        layout.addWidget(self.ref_tabs)
+
+        self._create_works_table_tab()
+        self.ref_tabs.addTab(self.works_tab, "Работы")
+
+        self._create_materials_table_tab()
+        self.ref_tabs.addTab(self.materials_tab, "Материалы")
+
+        self._create_links_tab()
+        self.ref_tabs.addTab(self.links_tab, "Связи")
+
+    def _create_works_table_tab(self):
+        self.works_tab = QWidget()
+        layout = QVBoxLayout(self.works_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        filter_row = QHBoxLayout()
+        self.works_filter_edit = QLineEdit()
+        self.works_filter_edit.setPlaceholderText("Поиск...")
+        self.works_filter_edit.setFixedWidth(300)
+        self.works_filter_edit.textChanged.connect(self._filter_works)
+        filter_row.addWidget(QLabel("Поиск:"))
+        filter_row.addWidget(self.works_filter_edit)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        self.works_table = QTableWidget()
+        self.works_table.setColumnCount(5)
+        self.works_table.setHorizontalHeaderLabels(["№", "Название", "Ед. изм.", "Цена В1", "Цена В2"])
+        self.works_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.works_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.works_table.verticalHeader().setVisible(False)
+        self.works_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.works_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.works_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.works_table)
+
+        form = QFormLayout()
+        self.ref_work_name = QLineEdit()
+        self.ref_work_unit = QLineEdit()
+        self.ref_work_price1 = QDoubleSpinBox(); self.ref_work_price1.setRange(0, 99999999); self.ref_work_price1.setDecimals(2)
+        self.ref_work_price2 = QDoubleSpinBox(); self.ref_work_price2.setRange(0, 99999999); self.ref_work_price2.setDecimals(2)
+        form.addRow("Название:", self.ref_work_name)
+        form.addRow("Ед. изм.:", self.ref_work_unit)
+        form.addRow("Цена В1:", self.ref_work_price1)
+        form.addRow("Цена В2:", self.ref_work_price2)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.btn_add_work = QPushButton("➕ Добавить"); self.btn_add_work.clicked.connect(self._add_work)
+        self.btn_update_work = QPushButton("✏️ Обновить"); self.btn_update_work.clicked.connect(self._update_work)
+        self.btn_delete_work = QPushButton("🗑 Удалить"); self.btn_delete_work.clicked.connect(self._delete_work)
+        btn_row.addWidget(self.btn_add_work)
+        btn_row.addWidget(self.btn_update_work)
+        btn_row.addWidget(self.btn_delete_work)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._refresh_works_table()
+
+    def _create_materials_table_tab(self):
+        self.materials_tab = QWidget()
+        layout = QVBoxLayout(self.materials_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        filter_row = QHBoxLayout()
+        self.materials_filter_edit = QLineEdit()
+        self.materials_filter_edit.setPlaceholderText("Поиск...")
+        self.materials_filter_edit.setFixedWidth(300)
+        self.materials_filter_edit.textChanged.connect(self._filter_materials)
+        filter_row.addWidget(QLabel("Поиск:"))
+        filter_row.addWidget(self.materials_filter_edit)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        self.materials_table = QTableWidget()
+        self.materials_table.setColumnCount(5)
+        self.materials_table.setHorizontalHeaderLabels(["№", "Название", "Ед. изм.", "Цена В1", "Цена В2"])
+        self.materials_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.materials_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.materials_table.verticalHeader().setVisible(False)
+        self.materials_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.materials_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.materials_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.materials_table)
+
+        form = QFormLayout()
+        self.ref_mat_name = QLineEdit()
+        self.ref_mat_unit = QLineEdit()
+        self.ref_mat_price1 = QDoubleSpinBox(); self.ref_mat_price1.setRange(0, 99999999); self.ref_mat_price1.setDecimals(2)
+        self.ref_mat_price2 = QDoubleSpinBox(); self.ref_mat_price2.setRange(0, 99999999); self.ref_mat_price2.setDecimals(2)
+        form.addRow("Название:", self.ref_mat_name)
+        form.addRow("Ед. изм.:", self.ref_mat_unit)
+        form.addRow("Цена В1:", self.ref_mat_price1)
+        form.addRow("Цена В2:", self.ref_mat_price2)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.btn_add_mat = QPushButton("➕ Добавить"); self.btn_add_mat.clicked.connect(self._add_material)
+        self.btn_update_mat = QPushButton("✏️ Обновить"); self.btn_update_mat.clicked.connect(self._update_material)
+        self.btn_delete_mat = QPushButton("🗑 Удалить"); self.btn_delete_mat.clicked.connect(self._delete_material)
+        btn_row.addWidget(self.btn_add_mat)
+        btn_row.addWidget(self.btn_update_mat)
+        btn_row.addWidget(self.btn_delete_mat)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._refresh_materials_table()
+
+    def _create_links_tab(self):
+        self.links_tab = QWidget()
+        layout = QVBoxLayout(self.links_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        combo_row = QHBoxLayout()
+        self.link_work_combo = QComboBox()
+        self.link_work_combo.setEditable(True)
+        self.link_work_combo.setFixedWidth(400)
+        self.link_work_combo.currentTextChanged.connect(self._refresh_links_table)
+        combo_row.addWidget(QLabel("Работа:"))
+        combo_row.addWidget(self.link_work_combo)
+        combo_row.addStretch()
+        layout.addLayout(combo_row)
+
+        self.links_table = QTableWidget()
+        self.links_table.setColumnCount(6)
+        self.links_table.setHorizontalHeaderLabels(["Материал", "Ед. изм.", "Расход В1", "Расход В2", "Цена В1", "Цена В2"])
+        self.links_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.links_table.verticalHeader().setVisible(False)
+        self.links_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.links_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.links_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.links_table)
+
+        btn_row = QHBoxLayout()
+        self.btn_add_link = QPushButton("➕ Добавить связь"); self.btn_add_link.clicked.connect(self._add_link)
+        self.btn_remove_link = QPushButton("🗑 Удалить связь"); self.btn_remove_link.clicked.connect(self._remove_link)
+        btn_row.addWidget(self.btn_add_link)
+        btn_row.addWidget(self.btn_remove_link)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._refresh_link_works_combo()
+
+    # =======================================================================
+    # РАБОТЫ: refresh, filter, CRUD
+    # =======================================================================
+    def _refresh_works_table(self):
+        df = self.db_mgr.get_works()
+        self.works_table.setRowCount(len(df))
+        for i, row in df.iterrows():
+            self.works_table.setItem(i, 0, QTableWidgetItem(str(int(row['id']))))
+            self.works_table.setItem(i, 1, QTableWidgetItem(str(row['name'])))
+            self.works_table.setItem(i, 2, QTableWidgetItem(str(row['unit'])))
+            self.works_table.setItem(i, 3, _cell(row['price_1'], True))
+            self.works_table.setItem(i, 4, _cell(row['price_2'], True))
+        self.works_table.cellDoubleClicked.connect(self._on_works_double_click)
+
+    def _filter_works(self):
+        q = self.works_filter_edit.text().strip().lower()
+        for i in range(self.works_table.rowCount()):
+            item = self.works_table.item(i, 1)
+            if item:
+                self.works_table.setRowHidden(i, bool(q and q not in item.text().lower()))
+
+    def _on_works_double_click(self, row, col):
+        df = self.db_mgr.get_works()
+        if df.empty:
+            return
+        idx = df.index[row] if row < len(df) else 0
+        rd = df.iloc[idx]
+        self.ref_work_name.setText(str(rd['name']))
+        self.ref_work_unit.setText(str(rd['unit']))
+        self.ref_work_price1.setValue(float(rd['price_1']))
+        self.ref_work_price2.setValue(float(rd['price_2']))
+
+    def _add_work(self):
+        name = self.ref_work_name.text().strip()
+        unit = self.ref_work_unit.text().strip()
+        p1 = self.ref_work_price1.value()
+        p2 = self.ref_work_price2.value()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название работы.")
+            return
+        self.db_mgr.add_work(name, unit, p1, p2)
+        self._refresh_works_table()
+        self._refresh_works_combo()
+        self._refresh_link_works_combo()
+        self.statusBar().showMessage(f"Добавлена работа: {name}")
+        self._clear_ref_work_fields()
+
+    def _update_work(self):
+        row = self.works_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Ошибка", "Выберите работу.")
+            return
+        df = self.db_mgr.get_works()
+        if df.empty or row >= len(df):
+            return
+        wid = int(df.iloc[row]['id'])
+        name = self.ref_work_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название работы.")
+            return
+        self.db_mgr.update_work(wid, name=name, unit=self.ref_work_unit.text().strip(),
+                                price_1=self.ref_work_price1.value(), price_2=self.ref_work_price2.value())
+        self._refresh_works_table()
+        self._refresh_works_combo()
+        self._refresh_link_works_combo()
+        self.statusBar().showMessage(f"Обновлена работа: {name}")
+
+    def _delete_work(self):
+        row = self.works_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Ошибка", "Выберите работу.")
+            return
+        df = self.db_mgr.get_works()
+        if df.empty or row >= len(df):
+            return
+        name = df.iloc[row]['name']
+        wid = int(df.iloc[row]['id'])
+        if QMessageBox.question(self, "Подтверждение",
+                                 f'Удалить работу "{name}" и все привязанные материалы?',
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self.db_mgr.delete_work(wid)
+        self._refresh_works_table()
+        self._refresh_works_combo()
+        self._refresh_link_works_combo()
+        self.statusBar().showMessage(f"Удалена работа: {name}")
+
+    def _clear_ref_work_fields(self):
+        self.ref_work_name.clear()
+        self.ref_work_unit.clear()
+        self.ref_work_price1.setValue(0)
+        self.ref_work_price2.setValue(0)
+
+    # =======================================================================
+    # МАТЕРИАЛЫ: refresh, filter, CRUD
+    # =======================================================================
+    def _refresh_materials_table(self):
+        df = self.db_mgr.get_materials()
+        self.materials_table.setRowCount(len(df))
+        for i, row in df.iterrows():
+            self.materials_table.setItem(i, 0, QTableWidgetItem(str(int(row['id']))))
+            self.materials_table.setItem(i, 1, QTableWidgetItem(str(row['name'])))
+            self.materials_table.setItem(i, 2, QTableWidgetItem(str(row['unit'])))
+            self.materials_table.setItem(i, 3, _cell(row['price_1'], True))
+            self.materials_table.setItem(i, 4, _cell(row['price_2'], True))
+        self.materials_table.cellDoubleClicked.connect(self._on_materials_double_click)
+
+    def _filter_materials(self):
+        q = self.materials_filter_edit.text().strip().lower()
+        for i in range(self.materials_table.rowCount()):
+            item = self.materials_table.item(i, 1)
+            if item:
+                self.materials_table.setRowHidden(i, bool(q and q not in item.text().lower()))
+
+    def _on_materials_double_click(self, row, col):
+        df = self.db_mgr.get_materials()
+        if df.empty:
+            return
+        idx = df.index[row] if row < len(df) else 0
+        rd = df.iloc[idx]
+        self.ref_mat_name.setText(str(rd['name']))
+        self.ref_mat_unit.setText(str(rd['unit']))
+        self.ref_mat_price1.setValue(float(rd['price_1']))
+        self.ref_mat_price2.setValue(float(rd['price_2']))
+
+    def _add_material(self):
+        name = self.ref_mat_name.text().strip()
+        unit = self.ref_mat_unit.text().strip()
+        p1 = self.ref_mat_price1.value()
+        p2 = self.ref_mat_price2.value()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название материала.")
+            return
+        self.db_mgr.add_material(name, unit, p1, p2)
+        self._refresh_materials_table()
+        self.statusBar().showMessage(f"Добавлен материал: {name}")
+        self._clear_ref_mat_fields()
+
+    def _update_material(self):
+        row = self.materials_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Ошибка", "Выберите материал.")
+            return
+        df = self.db_mgr.get_materials()
+        if df.empty or row >= len(df):
+            return
+        mid = int(df.iloc[row]['id'])
+        name = self.ref_mat_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название материала.")
+            return
+        self.db_mgr.update_material(mid, name=name, unit=self.ref_mat_unit.text().strip(),
+                                     price_1=self.ref_mat_price1.value(), price_2=self.ref_mat_price2.value())
+        self._refresh_materials_table()
+        self.statusBar().showMessage(f"Обновлён материал: {name}")
+
+    def _delete_material(self):
+        row = self.materials_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Ошибка", "Выберите материал.")
+            return
+        df = self.db_mgr.get_materials()
+        if df.empty or row >= len(df):
+            return
+        name = df.iloc[row]['name']
+        mid = int(df.iloc[row]['id'])
+        if QMessageBox.question(self, "Подтверждение",
+                                 f'Удалить материал "{name}"?',
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self.db_mgr.delete_material(mid)
+        self._refresh_materials_table()
+        self.statusBar().showMessage(f"Удалён материал: {name}")
+
+    def _clear_ref_mat_fields(self):
+        self.ref_mat_name.clear()
+        self.ref_mat_unit.clear()
+        self.ref_mat_price1.setValue(0)
+        self.ref_mat_price2.setValue(0)
+
+    # =======================================================================
+    # СВЯЗИ
+    # =======================================================================
+    def _refresh_link_works_combo(self):
+        df = self.db_mgr.get_works()
+        names = df['name'].tolist() if not df.empty else []
+        cur = self.link_work_combo.currentText()
+        self.link_work_combo.blockSignals(True)
+        self.link_work_combo.clear()
+        self.link_work_combo.addItems(names)
+        if cur and cur in names:
+            self.link_work_combo.setCurrentText(cur)
+        elif names:
+            self.link_work_combo.setCurrentIndex(0)
+        self.link_work_combo.blockSignals(False)
+
+    def _refresh_links_table(self):
+        wn = self.link_work_combo.currentText().strip()
+        if not wn:
+            self.links_table.setRowCount(0)
+            return
+        wd = self.db_mgr.get_work_with_materials(wn)
+        if wd is None:
+            self.links_table.setRowCount(0)
+            return
+        mats = wd['materials']
+        self.links_table.setRowCount(len(mats))
+        for i, m in enumerate(mats):
+            self.links_table.setItem(i, 0, QTableWidgetItem(m['name']))
+            self.links_table.setItem(i, 1, QTableWidgetItem(m['unit']))
+            self.links_table.setItem(i, 2, _cell(m['consumption_1'], True))
+            self.links_table.setItem(i, 3, _cell(m['consumption_2'], True))
+            self.links_table.setItem(i, 4, _cell(m['price_1'], True))
+            self.links_table.setItem(i, 5, _cell(m['price_2'], True))
+        self.links_table.cellDoubleClicked.connect(self._on_link_double_click)
+
+    def _on_link_double_click(self, row, col):
+        if col not in (2, 3):
+            return
+        cur = self.links_table.item(row, col).text()
+        val, ok = QInputDialog.getDouble(self, "Изменение расхода", "Введите новое значение:",
+                                          float(cur) if cur and cur != "-" else 0.0,
+                                          0.0, 999999, 3)
+        if ok:
+            self.links_table.setItem(row, col, _cell(val, True))
+
+    def _add_link(self):
+        wn = self.link_work_combo.currentText().strip()
+        if not wn:
+            QMessageBox.warning(self, "Ошибка", "Выберите работу.")
+            return
+        df = self.db_mgr.get_materials()
+        if df.empty:
+            QMessageBox.warning(self, "Ошибка", "Нет материалов в справочнике.")
+            return
+        mat_names = df['name'].tolist()
+        mat_name, ok = QInputDialog.getItem(self, "Выбор материала", "Материал:", mat_names, 0, False)
+        if not ok:
+            return
+        work = self.db_mgr.get_work_by_name(wn)
+        mat = self.db_mgr.get_material_by_name(mat_name)
+        if work is None or mat is None:
+            QMessageBox.critical(self, "Ошибка", "Не найдена работа или материал.")
+            return
+        c1, ok1 = QInputDialog.getDouble(self, "Расход В1", "Норма расхода В1:", 0.0, 0, 999999, 3)
+        if not ok1:
+            return
+        c2, ok2 = QInputDialog.getDouble(self, "Расход В2", "Норма расхода В2:", 0.0, 0, 999999, 3)
+        if not ok2:
+            return
+        self.db_mgr.add_work_material_link(int(work['id']), int(mat['id']), c1, c2)
+        self._refresh_links_table()
+        self.statusBar().showMessage(f"Связь: {wn} → {mat_name}")
+
+    def _remove_link(self):
+        row = self.links_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Ошибка", "Выберите связь.")
+            return
+        wn = self.link_work_combo.currentText().strip()
+        mn = self.links_table.item(row, 0).text() if self.links_table.item(row, 0) else ""
+        if not wn or not mn:
+            return
+        work = self.db_mgr.get_work_by_name(wn)
+        mat = self.db_mgr.get_material_by_name(mn)
+        if work is None or mat is None:
+            return
+        self.db_mgr.remove_work_material_link(int(work['id']), int(mat['id']))
+        self._refresh_links_table()
+        self.statusBar().showMessage(f"Связь удалена: {wn} → {mn}")
+
+    # =======================================================================
+    # ComboBox
+    # =======================================================================
+    def _refresh_works_combo(self):
+        df = self.db_mgr.get_works()
+        names = df['name'].tolist() if not df.empty else []
+        cur = self.work_combo.currentText()
+        self.work_combo.blockSignals(True)
+        self.work_combo.clear()
+        self.work_combo.addItems(names)
+        if cur and cur in names:
+            self.work_combo.setCurrentText(cur)
+        elif names:
+            self.work_combo.setCurrentIndex(0)
+        self.work_combo.blockSignals(False)
+
+    def _on_work_combo_changed(self, text):
+        if not text:
+            return
+        work = self.db_mgr.get_work_by_name(text)
+        if work is not None:
+            self.price1_spin.setValue(float(work['price_1']))
+            self.price2_spin.setValue(float(work['price_2']))
+
+    # =======================================================================
+    # Действия со сметой
+    # =======================================================================
+    def _add_work_row(self):
+        work_name = self.work_combo.currentText().strip()
+        if not work_name:
+            QMessageBox.warning(self, "Ошибка", "Выберите или введите название работы.")
+            return
+        vol = self.vol_spin.value()
+        block = build_work_block(work_name, vol, None, len(self.smeta_rows) + 1, self.db_mgr)
+        if block is None:
+            QMessageBox.warning(self, "Ошибка",
+                                f'Работа "{work_name}" не найдена в справочнике.\n'
+                                f'Сначала добавьте её во вкладку "Справочник → Работы".')
+            return
+        self._push_undo_state()
+        self.smeta_rows.extend(block)
+        self._save_draft()
+        self._update_table_from_rows()
+        self.statusBar().showMessage(f"Добавлена: {work_name} (объём: {vol})")
+
+    def _show_section_dialog(self):
+        dlg = SectionDialog(self.sections, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._push_undo_state()
+            self.sections = dlg.get_sections()
+            self._rebuild_with_sections()
+            self._save_draft()
+            self._update_table_from_rows()
+
+    def _show_new_database_dialog(self):
+        """Показывает диалог создания новой базы данных."""
+        dlg = NewDatabaseDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_folder, new_name = dlg.get_values()
+            if not new_folder or not new_name:
+                QMessageBox.warning(self, "Ошибка", "Укажите папку и имя базы данных.")
+                return
+
+            # Подтверждение
+            reply = QMessageBox.question(
+                self, "Подтверждение",
+                f'Создать новую базу "{new_name}" в папке:\n{new_folder}\n\n'
+                f"Текущая база будет закрыта. Черновик будет сохранён.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            # Создаём новую базу
+            try:
+                os.makedirs(new_folder, exist_ok=True)
+                self.db_mgr.flush()
+                self.db_mgr.close()
+
+                self.db_folder = new_folder
+                self.db_mgr = DatabaseManager(new_folder, new_name)
+
+                self.statusBar().showMessage(f"База создана: {os.path.join(new_folder, new_name + '.db')}")
+                QMessageBox.information(self, "База создана",
+                                       f"Новая база данных создана:\n{os.path.join(new_folder, new_name + '.db')}")
+
+                self._refresh_works_combo()
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка создания базы", str(e))
+
+    def _rebuild_with_sections(self):
+        filtered = [r for r in self.smeta_rows if not is_section(str(r[1]))]
+        new_rows = []
+        for sec in self.sections:
+            new_rows.append(("", f"{SECTION_PREFIX}{sec}", "", "", "", "", "", "", "", "", ""))
+        new_rows.extend(filtered)
+        self.smeta_rows = new_rows
+
+    def _add_expense_row(self):
+        self.smeta_rows.append(("Накладные и транспортные расходы", "", "", "",
+                                self.extra_overhead1, "", "", "",
+                                self.extra_overhead2, "", ""))
+        self._save_draft()
+        self._update_table_from_rows()
+
+    def _recalc_smeta(self):
+        self._push_undo_state()
+        self.smeta_rows = rebuild_smeta(self.smeta_rows)
+        self._update_table_from_rows()
+        self._save_draft()
+        self.statusBar().showMessage("Смета пересчитана")
+
+    def _clear_smeta(self):
+        if QMessageBox.question(self, "Подтверждение", "Очистить всю смету?",
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self._push_undo_state()
+        self.smeta_rows = []
+        self.sections = []
+        self.smeta_title = "Смета"
+        self.title_edit.setText(self.smeta_title)
+        self._update_table_from_rows()
+        self._update_totals()
+        self._save_draft()
+        self.statusBar().showMessage("Смета очищена")
+
+    # =======================================================================
+    # Обновление таблицы и итогов
+    # =======================================================================
+    def _update_table_from_rows(self):
+        self.smeta_table.setRowCount(len(self.smeta_rows))
+        for r_idx, row in enumerate(self.smeta_rows):
+            for c_idx in range(len(CALC_HEADERS)):
+                val = row[c_idx] if c_idx < len(row) else ""
+                ra = c_idx in (COL_NUM, COL_COST1, COL_COST2, COL_NORM1, COL_NORM2,
+                               COL_VOL1, COL_VOL2, COL_PRICE1, COL_PRICE2)
+                item = _cell(val, ra)
+                item.setData(Qt.ItemDataRole.UserRole, list(row))
+                self.smeta_table.setItem(r_idx, c_idx, item)
+
+            name = str(row[1]).strip() if len(row) > 1 else ""
+            if is_section(name):
+                bg = QColor(225, 190, 231)
+                for c in range(len(CALC_HEADERS)):
+                    it = self.smeta_table.item(r_idx, c)
+                    if it: it.setBackground(bg)
+            elif is_work(name):
+                bg = QColor(255, 242, 204)
+                for c in range(len(CALC_HEADERS)):
+                    it = self.smeta_table.item(r_idx, c)
+                    if it:
+                        it.setBackground(bg)
+                        it.setFont(QFont(FONT_FAMILY, FONT_SIZE, QFont.Weight.Bold))
+            elif is_material(name):
+                for c in range(len(CALC_HEADERS)):
+                    it = self.smeta_table.item(r_idx, c)
+                    if it:
+                        it.setFont(QFont(FONT_FAMILY, FONT_SIZE, QFont.Weight.Normal))
+            elif is_total(name):
+                bg = QColor(189, 215, 238)
+                for c in range(len(CALC_HEADERS)):
+                    it = self.smeta_table.item(r_idx, c)
+                    if it:
+                        it.setBackground(bg)
+                        it.setFont(QFont(FONT_FAMILY, FONT_SIZE, QFont.Weight.Bold))
+
+        self._update_totals()
+
+    def _update_totals(self):
+        t1, t2 = compute_grand_totals(self.smeta_rows)
+        savings = t1 - t2
+        ratio = (t2 / t1 * 100) if t1 > 0 else 0.0
+        self.lbl_total1.setText(f"Итого В1: {t1:,.2f} руб.")
+        self.lbl_total2.setText(f"Итого В2: {t2:,.2f} руб.")
+        self.lbl_savings.setText(f"Экономия: {savings:,.2f} руб. ({ratio:.1f}%)")
+
+    # =======================================================================
+    # Редактирование ячеек
+    # =======================================================================
+    def _on_cell_double_click(self, row, col):
+        if row < 0 or row >= len(self.smeta_rows):
+            return
+        row_data = list(self.smeta_rows[row])
+        name = str(row_data[1]).strip()
+
+        if is_section(name):
+            new_name, ok = QInputDialog.getText(self, "Редактирование раздела",
+                                                 "Название раздела:",
+                                                 Qt.InputMode.TextInput,
+                                                 clean_name(name))
+            if ok and new_name:
+                self._push_undo_state()
+                idx = self.sections.index(clean_name(name)) if clean_name(name) in self.sections else -1
+                if idx >= 0:
+                    self.sections[idx] = new_name
+                row_data[1] = f"{SECTION_PREFIX}{new_name}"
+                self.smeta_rows[row] = tuple(row_data)
+                self._update_table_from_rows()
+                self._save_draft()
+            return
+
+        editable = EDITABLE_WORK if is_work(name) else (EDITABLE_MAT if is_material(name) else set())
+        if not editable or col not in editable:
+            return
+
+        cur = row_data[col]
+        cur_str = str(cur).replace(",", ".") if cur else "0"
+        try:
+            cur_num = float(cur_str)
+        except (ValueError, TypeError):
+            cur_num = 0.0
+
+        decimals = 3 if col in (COL_NORM1, COL_NORM2, COL_VOL1, COL_VOL2) else 2
+        val, ok = QInputDialog.getDouble(self, "Редактирование",
+                                          f"Значение ({CALC_HEADERS[col]}):",
+                                          cur_num, 0.0, 99999999, decimals)
+        if ok:
+            self._push_undo_state()
+            row_data[col] = round(val, 3) if col in (COL_NORM1, COL_NORM2, COL_VOL1, COL_VOL2) else round(val, 2)
+            self.smeta_rows[row] = tuple(row_data)
+            self.smeta_rows = rebuild_smeta(self.smeta_rows)
+            self._update_table_from_rows()
+            self._save_draft()
+            self.statusBar().showMessage(f"Изменено: {CALC_HEADERS[col]} = {val}")
+
+    # =======================================================================
+    # Контекстное меню
+    # =======================================================================
+    def _show_table_context_menu(self, pos):
+        menu = self.smeta_table.createStandardContextMenu()
+        menu.addSeparator()
+        act_copy = QAction("📋 Копировать", self)
+        act_copy.triggered.connect(self._copy_cell)
+        menu.addAction(act_copy)
+        act_paste = QAction("📌 Вставить", self)
+        act_paste.triggered.connect(self._paste_cell)
+        menu.addAction(act_paste)
+        menu.exec(self.smeta_table.viewport().mapToGlobal(pos))
 
     def _copy_cell(self):
-        """Копирует значение ячейки в буфер обмена."""
-        if self.ctx_menu_item:
-            col_idx = int(self.ctx_menu_col[1:]) - 1
-            val = self.tree_smeta.item(self.ctx_menu_item, 'values')[col_idx]
-            self.root.clipboard_clear()
-            self.root.clipboard_append(str(val))
+        sel = self.smeta_table.selectedItems()
+        if not sel:
+            return
+        r, c = sel[0].row(), sel[0].column()
+        if r < 0 or r >= len(self.smeta_rows):
+            return
+        self.copied_value = self.smeta_rows[r][c] if c < len(self.smeta_rows[r]) else None
+        self.copied_row = r
+        self.statusBar().showMessage("Значение скопировано")
 
     def _paste_cell(self):
-        """Вставляет значение из буфера обмена в ячейку."""
-        if not self.ctx_menu_item:
+        if self.copied_value is None:
+            return
+        sel = self.smeta_table.selectedItems()
+        if not sel:
+            return
+        r, c = sel[0].row(), sel[0].column()
+        if r < 0 or r >= len(self.smeta_rows) or c >= len(CALC_HEADERS):
+            return
+        self._push_undo_state()
+        row_data = list(self.smeta_rows[r])
+        row_data[c] = self.copied_value
+        self.smeta_rows[r] = tuple(row_data)
+        self.smeta_rows = rebuild_smeta(self.smeta_rows)
+        self._update_table_from_rows()
+        self._save_draft()
+
+    # =======================================================================
+    # Undo / Redo
+    # =======================================================================
+    def _push_undo_state(self):
+        """Сохраняет текущее состояние в undo-стек."""
+        state = {
+            'rows': [list(r) for r in self.smeta_rows],
+            'title': self.smeta_title,
+            'sections': list(self.sections),
+            'extra': (self.extra_overhead1, self.extra_overhead2,
+                      self.extra_lifting1, self.extra_lifting2,
+                      self.extra_trash1, self.extra_trash2),
+        }
+        self._undo_stack.append(state)
+        self._redo_stack.clear()  # Очищаем redo-стек при новом действии
+
+    def _undo(self):
+        if not self._undo_stack:
+            self.statusBar().showMessage("Нечего отменять")
+            return
+        state = self._undo_stack.pop()
+        self._redo_stack.append({
+            'rows': [list(r) for r in self.smeta_rows],
+            'title': self.smeta_title,
+            'sections': list(self.sections),
+            'extra': (self.extra_overhead1, self.extra_overhead2,
+                      self.extra_lifting1, self.extra_lifting2,
+                      self.extra_trash1, self.extra_trash2),
+        })
+        self._restore_state(state)
+        self.statusBar().showMessage("Действие отменено (Ctrl+Z)")
+
+    def _redo(self):
+        if not self._redo_stack:
+            self.statusBar().showMessage("Нечего повторять")
+            return
+        state = self._redo_stack.pop()
+        self._undo_stack.append({
+            'rows': [list(r) for r in self.smeta_rows],
+            'title': self.smeta_title,
+            'sections': list(self.sections),
+            'extra': (self.extra_overhead1, self.extra_overhead2,
+                      self.extra_lifting1, self.extra_lifting2,
+                      self.extra_trash1, self.extra_trash2),
+        })
+        self._restore_state(state)
+        self.statusBar().showMessage("Действие повторено (Ctrl+Y)")
+
+    def _restore_state(self, state):
+        self.smeta_rows = [tuple(r) for r in state['rows']]
+        self.smeta_title = state['title']
+        self.sections = state['sections']
+        self.title_edit.setText(self.smeta_title)
+        extra = state['extra']
+        self.extra_overhead1, self.extra_overhead2 = extra[0], extra[1]
+        self.extra_lifting1, self.extra_lifting2 = extra[2], extra[3]
+        self.extra_trash1, self.extra_trash2 = extra[4], extra[5]
+        self.overhead1_spin.setValue(self.extra_overhead1)
+        self.overhead2_spin.setValue(self.extra_overhead2)
+        self.lifting1_spin.setValue(self.extra_lifting1)
+        self.lifting2_spin.setValue(self.extra_lifting2)
+        self.trash1_spin.setValue(self.extra_trash1)
+        self.trash2_spin.setValue(self.extra_trash2)
+        self._update_table_from_rows()
+
+    # =======================================================================
+    # Черновик
+    # =======================================================================
+    def _save_draft(self):
+        draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        try:
+            prev_state = {}
+            if os.path.exists(draft_path):
+                with open(draft_path, 'r', encoding='utf-8') as f:
+                    prev_state = json.load(f)
+
+            current_state = {
+                'rows': [list(r) for r in self.smeta_rows],
+                'title': self.smeta_title,
+                'sections': list(self.sections),
+                'extra': (self.extra_overhead1, self.extra_overhead2,
+                          self.extra_lifting1, self.extra_lifting2,
+                          self.extra_trash1, self.extra_trash2),
+            }
+            draft = {
+                'prev_state': prev_state,
+                'current_state': current_state,
+                'timestamp': datetime.now().isoformat(),
+            }
+            with open(draft_path, 'w', encoding='utf-8') as f:
+                json.dump(draft, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка сохранения черновика: {e}")
+
+    def _load_draft(self):
+        draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        if not os.path.exists(draft_path):
             return
         try:
-            clip = self.root.clipboard_get().strip()
-        except tk.TclError:
+            with open(draft_path, 'r', encoding='utf-8') as f:
+                draft = json.load(f)
+            current = draft.get('current_state')
+            if current is None:
+                return
+            self._restore_state(current)
+            self.statusBar().showMessage("Черновик восстановлен")
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка загрузки черновика: {e}")
+
+    # =======================================================================
+    # Экспорт / Импорт
+    # =======================================================================
+    def _export_to_excel(self):
+        if not self.smeta_rows:
+            QMessageBox.warning(self, "Ошибка", "Смета пуста.")
             return
-        col_idx = int(self.ctx_menu_col[1:]) - 1
-        vals = self.tree_smeta.item(self.ctx_menu_item, 'values')
-        name_raw = str(vals[1]).strip()
-        if col_idx not in self._editable_cols_for(name_raw):
+        os.makedirs(self.export_folder, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.smeta_title}_{ts}.xlsx"
+        path = os.path.join(self.export_folder, filename)
+        try:
+            meta_rows = []
+            for row in self.smeta_rows:
+                if is_work(row[1]) or is_material(row[1]):
+                    meta_rows.append(list(row))
+            export_smeta_to_excel(
+                rows=self.smeta_rows, output_path=path,
+                title=self.smeta_title, meta_rows=meta_rows,
+                overhead1=self.extra_overhead1, overhead2=self.extra_overhead2,
+                lift1=self.extra_lifting1, lift2=self.extra_lifting2,
+                trash1=self.extra_trash1, trash2=self.extra_trash2,
+            )
+            self.statusBar().showMessage(f"Экспорт: {path}")
+            QMessageBox.information(self, "Экспорт", f"Смета экспортирована:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка экспорта", str(e))
+
+    def _import_from_excel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл Excel", self.export_folder, "Excel (*.xlsx)"
+        )
+        if not path:
             return
-        self._start_cell_edit(self.ctx_menu_item, vals, col_idx)
-        if self.edit_entry and self.edit_entry.winfo_exists():
-            self.edit_entry.delete(0, tk.END)
-            self.edit_entry.insert(0, clip)
-            self.edit_entry.icursor(tk.END)
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, data_only=True)
+            if "Смета" not in wb.sheetnames:
+                QMessageBox.warning(self, "Ошибка", "Нет листа 'Смета'.")
+                return
+            ws = wb["Смета"]
+            values = [list(row) for row in ws.iter_rows(values_only=True)]
+            parsed = parse_exported_sheet(values)
+            seq = parsed['sequence']
+            if not seq:
+                QMessageBox.warning(self, "Ошибка", "Не удалось распознать строки сметы.")
+                return
+
+            self.smeta_rows = []
+            self.sections = []
+            self.smeta_title = parsed['title'] if parsed['title'] else "Смета"
+            self.title_edit.setText(self.smeta_title)
+
+            self.extra_overhead1, self.extra_overhead2 = parsed['overhead']
+            self.extra_lifting1, self.extra_lifting2 = parsed['lifting']
+            self.extra_trash1, self.extra_trash2 = parsed['lifting_trash']
+
+            for sp in [self.overhead1_spin, self.overhead2_spin,
+                       self.lifting1_spin, self.lifting2_spin,
+                       self.trash1_spin, self.trash2_spin]:
+                sp.setValue(0)
+            self.overhead1_spin.setValue(self.extra_overhead1)
+            self.overhead2_spin.setValue(self.extra_overhead2)
+            self.lifting1_spin.setValue(self.extra_lifting1)
+            self.lifting2_spin.setValue(self.extra_lifting2)
+            self.trash1_spin.setValue(self.extra_trash1)
+            self.trash2_spin.setValue(self.extra_trash2)
+
+            for item in seq:
+                if item[0] == 'section':
+                    self.sections.append(item[1])
+                elif item[0] == 'work':
+                    block = build_work_block(item[1], item[2], None, len(self.smeta_rows) + 1, self.db_mgr)
+                    if block:
+                        self.smeta_rows.extend(block)
+
+            self.smeta_rows = rebuild_smeta(self.smeta_rows)
+            self._update_table_from_rows()
+            self._save_draft()
+
+            self._refresh_works_table()
+            self._refresh_materials_table()
+            self._refresh_works_combo()
+            self._refresh_link_works_combo()
+
+            self.statusBar().showMessage(f"Импорт: {path}")
+            QMessageBox.information(self, "Импорт", f"Смета импортирована:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка импорта", str(e))
+
+    # =======================================================================
+    # Слоты
+    # =======================================================================
+    def _on_title_changed(self, text):
+        self.smeta_title = text.strip() if text else "Смета"
+
+    def _on_extra_changed(self, _):
+        self.extra_overhead1 = self.overhead1_spin.value()
+        self.extra_overhead2 = self.overhead2_spin.value()
+        self.extra_lifting1 = self.lifting1_spin.value()
+        self.extra_lifting2 = self.lifting2_spin.value()
+        self.extra_trash1 = self.trash1_spin.value()
+        self.extra_trash2 = self.trash2_spin.value()
+        self._save_draft()
+
+    # =======================================================================
+    # Справка / Настройки
+    # =======================================================================
+    def _show_about(self):
+        QMessageBox.about(
+            self, "О программе — Сметчик PRO 5.3",
+            "Сметчик PRO 5.3\n\n"
+            "Приложение для составления смет с поддержкой двух вариантов цены.\n\n"
+            "Автор: pto_plus | Лицензия: MIT\n\n"
+            "Технологии: Python 3, PyQt6, SQLite, pandas, openpyxl, xlsxwriter\n\n"
+            "Функционал:\n"
+            "• Справочник работ и материалов с ценами В1 и В2\n"
+            "• Автоматический расчёт материалов по нормам расхода\n"
+            "• Сравнение вариантов стоимости и расчёт экономии\n"
+            "• Экспорт в Excel с формулами и форматированием\n"
+            "• Импорт смет из Excel с восстановлением структуры\n"
+            "• Черновик сметы с автосохранением\n"
+            "• Управление разделами сметы\n"
+            "• Дополнительные расходы: накладные, подъёмные механизмы, вывоз мусора\n"
+            "• Создание и переключение между базами данных\n\n"
+            "Горячие клавиши:\n"
+            "Ctrl+S — Сохранить черновик\n"
+            "Ctrl+E — Экспорт в Excel\n"
+            "Ctrl+I — Импорт из Excel\n"
+            "Ctrl+Z — Отменить действие\n"
+            "Ctrl+Y — Повторить действие\n"
+            "Ctrl+W — Добавить работу\n"
+            "Ctrl+D — Добавить раздел\n"
+            "Ctrl+Q — Выход\n\n"
+            "Документация: https://docs.kodacode.ru\n"
+            "Сообщество: https://t.me/kodacommunity",
+        )
+
+    def show_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.folder_edit.setText(self.db_folder)
+        dlg.export_edit.setText(self.export_folder)
+        dlg.koeff_spin.setValue(self.koeff_price)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            folder, export, koeff = dlg.get_values()
+            if folder:
+                self.db_folder = folder
+            if export:
+                self.export_folder = export
+            self.koeff_price = koeff
+            self.statusBar().showMessage("Настройки сохранены")
+
+    # =======================================================================
+    # Закрытие
+    # =======================================================================
+    def closeEvent(self, event):
+        self._save_draft()
+        if self.db_mgr:
+            self.db_mgr.flush()
+            self.db_mgr.close()
+        event.accept()
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+def main():
+    """Запускает приложение «Сметчик PRO 5.2»."""
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = SmetaMainWindow()
+    window.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = SmetaApp(root)
-    root.mainloop()
+    main()
