@@ -34,7 +34,7 @@ from db_manager import DatabaseManager
 # Константы
 # ---------------------------------------------------------------------------
 DRAFT_FILE = "smeta_draft.json"
-WINDOW_SIZE = (1400, 900)
+WINDOW_SIZE = (1500, 900)
 FONT_FAMILY = "Segoe UI"
 FONT_SIZE = 10
 TABLE_ROW_HEIGHT = 28
@@ -54,6 +54,9 @@ COL_COST2 = 10
 
 EDITABLE_WORK = {COL_NORM1, COL_VOL1, COL_PRICE1, COL_NORM2, COL_VOL2, COL_PRICE2}
 EDITABLE_MAT = {COL_NORM1, COL_PRICE1, COL_NORM2, COL_PRICE2}
+
+# Файл для сохранения ширин колонок
+COLUMN_WIDTHS_FILE = "column_widths.json"
 
 
 def _cell(value, right_align=False):
@@ -317,6 +320,8 @@ class SmetaMainWindow(QMainWindow):
         self.extra_lifting2 = 0.0
         self.extra_trash1 = 0.0
         self.extra_trash2 = 0.0
+        self.extra_betonopump1 = 0.0
+        self.extra_betonopump2 = 0.0
         self.sections = []
         self.works_combo_list = []
 
@@ -364,6 +369,8 @@ class SmetaMainWindow(QMainWindow):
         # --- Загружаем черновик ---
         self._load_draft()
         self._refresh_works_combo()
+        self._load_column_widths()
+        self._load_window_geometry()
 
     # =======================================================================
     # Меню
@@ -481,15 +488,17 @@ class SmetaMainWindow(QMainWindow):
         self.vol_spin.setValue(1.0)
         self.vol_spin.setFixedWidth(100)
 
-        self.price1_spin = QDoubleSpinBox()
-        self.price1_spin.setRange(0, 99999999)
-        self.price1_spin.setDecimals(2)
-        self.price1_spin.setFixedWidth(120)
+        self.price1_label = QLabel("0.00")
+        self.price1_label.setFont(QFont(FONT_FAMILY, 10, QFont.Weight.Bold))
+        self.price1_label.setFixedWidth(120)
+        self.price1_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.price1_label.setStyleSheet("color: #555; background: #f5f5f5; padding: 2px 4px; border-radius: 3px;")
 
-        self.price2_spin = QDoubleSpinBox()
-        self.price2_spin.setRange(0, 99999999)
-        self.price2_spin.setDecimals(2)
-        self.price2_spin.setFixedWidth(120)
+        self.price2_label = QLabel("0.00")
+        self.price2_label.setFont(QFont(FONT_FAMILY, 10, QFont.Weight.Bold))
+        self.price2_label.setFixedWidth(120)
+        self.price2_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.price2_label.setStyleSheet("color: #555; background: #f5f5f5; padding: 2px 4px; border-radius: 3px;")
 
         add_row.addWidget(QLabel("Добавить работу:"))
         add_row.addWidget(self.work_combo)
@@ -497,9 +506,9 @@ class SmetaMainWindow(QMainWindow):
         add_row.addWidget(QLabel("Объём:"))
         add_row.addWidget(self.vol_spin)
         add_row.addWidget(QLabel("Цена В1:"))
-        add_row.addWidget(self.price1_spin)
+        add_row.addWidget(self.price1_label)
         add_row.addWidget(QLabel("Цена В2:"))
-        add_row.addWidget(self.price2_spin)
+        add_row.addWidget(self.price2_label)
         layout.addLayout(add_row)
 
         # Таблица сметы
@@ -517,7 +526,8 @@ class SmetaMainWindow(QMainWindow):
         self.smeta_table.horizontalHeader().setStretchLastSection(True)
         self.smeta_table.cellDoubleClicked.connect(self._on_cell_double_click)
         self.smeta_table.customContextMenuRequested.connect(self._show_table_context_menu)
-        layout.addWidget(self.smeta_table)
+        self.smeta_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
+        layout.addWidget(self.smeta_table, 1)  # stretch=1 — растягивается только таблица сметы
 
         # Итоги
         totals_widget = QWidget()
@@ -534,22 +544,38 @@ class SmetaMainWindow(QMainWindow):
         totals_layout.addStretch()
         layout.addWidget(totals_widget)
 
-        # Доп. расходы
+        # Доп. расходы — таблица
         exp_widget = QWidget()
-        exp_layout = QFormLayout(exp_widget)
-        self.overhead1_spin = QDoubleSpinBox(); self.overhead1_spin.setRange(0, 99999999); self.overhead1_spin.setDecimals(2)
-        self.overhead2_spin = QDoubleSpinBox(); self.overhead2_spin.setRange(0, 99999999); self.overhead2_spin.setDecimals(2)
-        self.lifting1_spin = QDoubleSpinBox(); self.lifting1_spin.setRange(0, 99999999); self.lifting1_spin.setDecimals(2)
-        self.lifting2_spin = QDoubleSpinBox(); self.lifting2_spin.setRange(0, 99999999); self.lifting2_spin.setDecimals(2)
-        self.trash1_spin = QDoubleSpinBox(); self.trash1_spin.setRange(0, 99999999); self.trash1_spin.setDecimals(2)
-        self.trash2_spin = QDoubleSpinBox(); self.trash2_spin.setRange(0, 99999999); self.trash2_spin.setDecimals(2)
+        exp_layout = QVBoxLayout(exp_widget)
 
-        exp_layout.addRow("Накладные (В1):", self.overhead1_spin)
-        exp_layout.addRow("Накладные (В2):", self.overhead2_spin)
-        exp_layout.addRow("Подъёмные (В1):", self.lifting1_spin)
-        exp_layout.addRow("Подъёмные (В2):", self.lifting2_spin)
-        exp_layout.addRow("Вывоз мусора (В1):", self.trash1_spin)
-        exp_layout.addRow("Вывоз мусора (В2):", self.trash2_spin)
+        self.extra_table = QTableWidget()
+        self.extra_table.setColumnCount(3)
+        self.extra_table.setHorizontalHeaderLabels(["Затраты", "Стоимость В1", "Стоимость В2"])
+        self.extra_table.setRowCount(4)
+        self.extra_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.extra_table.verticalHeader().setVisible(False)
+        self.extra_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.extra_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.extra_table.horizontalHeader().setStretchLastSection(True)
+        self.extra_table.cellDoubleClicked.connect(self._on_extra_cell_double_click)
+
+        row_labels = [
+            "Накладные и транспортные расходы",
+            "Подъёмные механизмы",
+            "Вывоз мусора",
+            "Бетононасос",
+        ]
+        for r, label in enumerate(row_labels):
+            self.extra_table.setItem(r, 0, QTableWidgetItem(label))
+            self.extra_table.item(r, 0).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.extra_table.item(r, 0).setFlags(self.extra_table.item(r, 0).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.extra_table.setItem(r, 1, _cell("0.00", True))
+            self.extra_table.setItem(r, 2, _cell("0.00", True))
+
+        self.extra_table.cellChanged.connect(self._on_extra_table_changed)
+        # Фиксированная высота: 4 строки + шапка
+        self.extra_table.setFixedHeight(4 * TABLE_ROW_HEIGHT + 32)
+        exp_layout.addWidget(self.extra_table)
         layout.addWidget(exp_widget)
 
         # Кнопки
@@ -571,11 +597,7 @@ class SmetaMainWindow(QMainWindow):
         btn_row.addWidget(btn_clear)
         layout.addLayout(btn_row)
 
-        # Сигналы spinbox-ов
-        for sp in [self.overhead1_spin, self.overhead2_spin,
-                   self.lifting1_spin, self.lifting2_spin,
-                   self.trash1_spin, self.trash2_spin]:
-            sp.valueChanged.connect(self._on_extra_changed)
+        # Сигналы — для extra_table уже подключён cellChanged
 
     # =======================================================================
     # Вкладка «Справочник»
@@ -623,6 +645,7 @@ class SmetaMainWindow(QMainWindow):
         self.works_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
         self.works_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.works_table.horizontalHeader().setStretchLastSection(True)
+        self.works_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
         layout.addWidget(self.works_table)
 
         form = QFormLayout()
@@ -673,6 +696,7 @@ class SmetaMainWindow(QMainWindow):
         self.materials_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
         self.materials_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.materials_table.horizontalHeader().setStretchLastSection(True)
+        self.materials_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
         layout.addWidget(self.materials_table)
 
         form = QFormLayout()
@@ -707,7 +731,7 @@ class SmetaMainWindow(QMainWindow):
         combo_row = QHBoxLayout()
         self.link_work_combo = QComboBox()
         self.link_work_combo.setEditable(True)
-        self.link_work_combo.setFixedWidth(400)
+        self.link_work_combo.setFixedWidth(700)
         self.link_work_combo.currentTextChanged.connect(self._refresh_links_table)
         combo_row.addWidget(QLabel("Работа:"))
         combo_row.addWidget(self.link_work_combo)
@@ -722,6 +746,7 @@ class SmetaMainWindow(QMainWindow):
         self.links_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
         self.links_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.links_table.horizontalHeader().setStretchLastSection(True)
+        self.links_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
         layout.addWidget(self.links_table)
 
         btn_row = QHBoxLayout()
@@ -1028,8 +1053,8 @@ class SmetaMainWindow(QMainWindow):
             return
         work = self.db_mgr.get_work_by_name(text)
         if work is not None:
-            self.price1_spin.setValue(float(work['price_1']))
-            self.price2_spin.setValue(float(work['price_2']))
+            self.price1_label.setText(f"{float(work['price_1']):.2f}")
+            self.price2_label.setText(f"{float(work['price_2']):.2f}")
 
     # =======================================================================
     # Действия со сметой
@@ -1107,9 +1132,18 @@ class SmetaMainWindow(QMainWindow):
         self.smeta_rows = new_rows
 
     def _add_expense_row(self):
+        """Добавляет строки дополнительных расходов в смету.
+        
+        Добавляет строки «Накладные и транспортные расходы» и «Бетононасос»
+        со значениями из соответствующих переменных экземпляра. После добавления
+        сохраняет черновик и обновляет таблицу сметы.
+        """
         self.smeta_rows.append(("Накладные и транспортные расходы", "", "", "",
                                 self.extra_overhead1, "", "", "",
                                 self.extra_overhead2, "", ""))
+        self.smeta_rows.append(("Бетононасос", "", "", "",
+                                self.extra_betonopump1, "", "", "",
+                                self.extra_betonopump2, "", ""))
         self._save_draft()
         self._update_table_from_rows()
 
@@ -1287,7 +1321,8 @@ class SmetaMainWindow(QMainWindow):
             'sections': list(self.sections),
             'extra': (self.extra_overhead1, self.extra_overhead2,
                       self.extra_lifting1, self.extra_lifting2,
-                      self.extra_trash1, self.extra_trash2),
+                      self.extra_trash1, self.extra_trash2,
+                      self.extra_betonopump1, self.extra_betonopump2),
         }
         self._undo_stack.append(state)
         self._redo_stack.clear()  # Очищаем redo-стек при новом действии
@@ -1325,6 +1360,17 @@ class SmetaMainWindow(QMainWindow):
         self.statusBar().showMessage("Действие повторено (Ctrl+Y)")
 
     def _restore_state(self, state):
+        """Восстанавливает состояние сметы из сохранённого словаря.
+        
+        Применяет сохранённые данные (строки сметы, название, разделы,
+        дополнительные расходы) к текущему состоянию окна. Корректно
+        обрабатывает как старые версии черновика (6 значений extra),
+        так и новые (8 значений с бетононасосом).
+        
+        Args:
+            state (dict): словарь состояния с ключами 'rows', 'title',
+                'sections', 'extra'.
+        """
         self.smeta_rows = [tuple(r) for r in state['rows']]
         self.smeta_title = state['title']
         self.sections = state['sections']
@@ -1333,12 +1379,11 @@ class SmetaMainWindow(QMainWindow):
         self.extra_overhead1, self.extra_overhead2 = extra[0], extra[1]
         self.extra_lifting1, self.extra_lifting2 = extra[2], extra[3]
         self.extra_trash1, self.extra_trash2 = extra[4], extra[5]
-        self.overhead1_spin.setValue(self.extra_overhead1)
-        self.overhead2_spin.setValue(self.extra_overhead2)
-        self.lifting1_spin.setValue(self.extra_lifting1)
-        self.lifting2_spin.setValue(self.extra_lifting2)
-        self.trash1_spin.setValue(self.extra_trash1)
-        self.trash2_spin.setValue(self.extra_trash2)
+        if len(extra) >= 8:
+            self.extra_betonopump1, self.extra_betonopump2 = extra[6], extra[7]
+        else:
+            self.extra_betonopump1 = self.extra_betonopump2 = 0.0
+        self._update_extra_table()
         self._update_table_from_rows()
 
     # =======================================================================
@@ -1358,7 +1403,8 @@ class SmetaMainWindow(QMainWindow):
                 'sections': list(self.sections),
                 'extra': (self.extra_overhead1, self.extra_overhead2,
                           self.extra_lifting1, self.extra_lifting2,
-                          self.extra_trash1, self.extra_trash2),
+                          self.extra_trash1, self.extra_trash2,
+                          self.extra_betonopump1, self.extra_betonopump2),
             }
             draft = {
                 'prev_state': prev_state,
@@ -1399,14 +1445,18 @@ class SmetaMainWindow(QMainWindow):
         try:
             meta_rows = []
             for row in self.smeta_rows:
-                if is_work(row[1]) or is_material(row[1]):
-                    meta_rows.append(list(row))
+                if is_work(row[1]):
+                    # 11 колонок → 10 колонок COLS: ['Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм', 'Расход_1', 'Цена_мат_1', 'Цена_раб_1', 'Расход_2', 'Цена_мат_2', 'Цена_раб_2']
+                    meta_rows.append([clean_name(row[1]), row[2], "-", "-", "-", 0, row[5], "-", 0, row[9]])
+                elif is_material(row[1]):
+                    meta_rows.append(["-", "-", clean_name(row[1]), row[2], row[3], row[5], 0, row[7], row[9], 0])
             export_smeta_to_excel(
                 rows=self.smeta_rows, output_path=path,
                 title=self.smeta_title, meta_rows=meta_rows,
                 overhead1=self.extra_overhead1, overhead2=self.extra_overhead2,
                 lift1=self.extra_lifting1, lift2=self.extra_lifting2,
                 trash1=self.extra_trash1, trash2=self.extra_trash2,
+                betonopump1=self.extra_betonopump1, betonopump2=self.extra_betonopump2,
             )
             self.statusBar().showMessage(f"Экспорт: {path}")
             QMessageBox.information(self, "Экспорт", f"Смета экспортирована:\n{path}")
@@ -1438,20 +1488,16 @@ class SmetaMainWindow(QMainWindow):
             self.smeta_title = parsed['title'] if parsed['title'] else "Смета"
             self.title_edit.setText(self.smeta_title)
 
+            self.extra_overhead1 = self.extra_overhead2 = 0.0
+            self.extra_lifting1 = self.extra_lifting2 = 0.0
+            self.extra_trash1 = self.extra_trash2 = 0.0
+            self.extra_betonopump1 = self.extra_betonopump2 = 0.0
             self.extra_overhead1, self.extra_overhead2 = parsed['overhead']
             self.extra_lifting1, self.extra_lifting2 = parsed['lifting']
             self.extra_trash1, self.extra_trash2 = parsed['lifting_trash']
-
-            for sp in [self.overhead1_spin, self.overhead2_spin,
-                       self.lifting1_spin, self.lifting2_spin,
-                       self.trash1_spin, self.trash2_spin]:
-                sp.setValue(0)
-            self.overhead1_spin.setValue(self.extra_overhead1)
-            self.overhead2_spin.setValue(self.extra_overhead2)
-            self.lifting1_spin.setValue(self.extra_lifting1)
-            self.lifting2_spin.setValue(self.extra_lifting2)
-            self.trash1_spin.setValue(self.extra_trash1)
-            self.trash2_spin.setValue(self.extra_trash2)
+            if 'betonopump' in parsed:
+                self.extra_betonopump1, self.extra_betonopump2 = parsed['betonopump']
+            self._update_extra_table()
 
             for item in seq:
                 if item[0] == 'section':
@@ -1481,14 +1527,188 @@ class SmetaMainWindow(QMainWindow):
     def _on_title_changed(self, text):
         self.smeta_title = text.strip() if text else "Смета"
 
-    def _on_extra_changed(self, _):
-        self.extra_overhead1 = self.overhead1_spin.value()
-        self.extra_overhead2 = self.overhead2_spin.value()
-        self.extra_lifting1 = self.lifting1_spin.value()
-        self.extra_lifting2 = self.lifting2_spin.value()
-        self.extra_trash1 = self.trash1_spin.value()
-        self.extra_trash2 = self.trash2_spin.value()
+    # =======================================================================
+    # Доп. расходы — таблица
+    # =======================================================================
+    def _update_extra_table(self):
+        """Заполняет таблицу дополнительных расходов значениями из переменных экземпляра.
+        
+        Синхронизирует отображение таблицы extra_table с текущими значениями
+        всех статей доп. расходов (накладные, подъёмные, вывоз мусора, бетононасос).
+        Вызывается при загрузке черновика, импорте из Excel и восстановлении состояния.
+        """
+        self.extra_table.item(0, 1).setText(f"{self.extra_overhead1:.2f}")
+        self.extra_table.item(0, 2).setText(f"{self.extra_overhead2:.2f}")
+        self.extra_table.item(1, 1).setText(f"{self.extra_lifting1:.2f}")
+        self.extra_table.item(1, 2).setText(f"{self.extra_lifting2:.2f}")
+        self.extra_table.item(2, 1).setText(f"{self.extra_trash1:.2f}")
+        self.extra_table.item(2, 2).setText(f"{self.extra_trash2:.2f}")
+        self.extra_table.item(3, 1).setText(f"{self.extra_betonopump1:.2f}")
+        self.extra_table.item(3, 2).setText(f"{self.extra_betonopump2:.2f}")
+
+    def _on_extra_table_changed(self, row, col):
+        """Слот, вызываемый при изменении ячейки таблицы дополнительных расходов.
+        
+        Считывает все значения из таблицы extra_table в соответствующие переменные
+        экземпляра, затем сохраняет черновик и пересчитывает итоговые суммы.
+        
+        Args:
+            row (int): индекс изменённой строки (не используется, читаются все строки).
+            col (int): индекс изменённой колонки (не используется, читаются все колонки).
+        """
+        self.extra_overhead1 = to_float(self.extra_table.item(0, 1).text())
+        self.extra_overhead2 = to_float(self.extra_table.item(0, 2).text())
+        self.extra_lifting1 = to_float(self.extra_table.item(1, 1).text())
+        self.extra_lifting2 = to_float(self.extra_table.item(1, 2).text())
+        self.extra_trash1 = to_float(self.extra_table.item(2, 1).text())
+        self.extra_trash2 = to_float(self.extra_table.item(2, 2).text())
+        self.extra_betonopump1 = to_float(self.extra_table.item(3, 1).text())
+        self.extra_betonopump2 = to_float(self.extra_table.item(3, 2).text())
         self._save_draft()
+        self._update_totals()
+
+    def _on_extra_cell_double_click(self, row, col):
+        """Обрабатывает двойной клик по ячейке таблицы дополнительных расходов.
+        
+        Создаёт временный QDoubleSpinBox, позиционированный поверх ячейки,
+        для удобного редактирования числовых значений. При завершении редактирования
+        сохраняет значение в ячейку и эмулирует сигнал cellChanged.
+        
+        Args:
+            row (int): строка ячейки.
+            col (int): колонка ячейки (0 — текстовое поле, игнорируется).
+        """
+        if col == 0:
+            return  # текстовое поле — не редактируем
+        current_text = self.extra_table.item(row, col).text()
+        current_val = to_float(current_text)
+
+        spin = QDoubleSpinBox(self)
+        spin.setRange(0, 99999999)
+        spin.setDecimals(2)
+        spin.setValue(current_val)
+        spin.setFixedWidth(140)
+        spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Позиционируем spin над ячейкой
+        rect = self.extra_table.cellRect(row, col)
+        header_h = self.extra_table.horizontalHeader().height()
+        viewport = self.extra_table.viewport()
+        pos = self.extra_table.mapToGlobal(viewport.pos() + rect.topLeft())
+
+        spin.move(pos.x(), pos.y() + header_h - 2)
+        spin.show()
+        spin.raise_()
+
+        def on_spin_finished():
+            """Завершает редактирование: записывает значение и удаляет spinbox."""
+            val = spin.value()
+            self.extra_table.item(row, col).setText(f"{val:.2f}")
+            self.extra_table.cellChanged.emit(row, col)
+            spin.deleteLater()
+
+        spin.editingFinished.connect(on_spin_finished)
+
+    # =======================================================================
+    # Сохранение / Загрузка ширин колонок и геометрии окна
+    # =======================================================================
+    def _save_column_widths(self):
+        """Сохраняет ширины колонок всех таблиц в JSON-файл.
+        
+        Собирает текущие ширины колонок четырёх таблиц (smeta_table, works_table,
+        materials_table, links_table) и записывает их в файл column_widths.json
+        в папке базы данных. Вызывается при изменении ширины любой колонки
+        (сигнал sectionResized) и при закрытии окна.
+        """
+        try:
+            widths = {
+                "smeta_table": [self.smeta_table.columnWidth(c) for c in range(self.smeta_table.columnCount())],
+                "works_table": [self.works_table.columnWidth(c) for c in range(self.works_table.columnCount())],
+                "materials_table": [self.materials_table.columnWidth(c) for c in range(self.materials_table.columnCount())],
+                "links_table": [self.links_table.columnWidth(c) for c in range(self.links_table.columnCount())],
+            }
+            path = os.path.join(self.db_folder, COLUMN_WIDTHS_FILE)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(widths, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _load_column_widths(self):
+        """Загружает ширины колонок всех таблиц из JSON-файла.
+        
+        Читает файл column_widths.json из папки базы данных и применяет
+        сохранённые ширины ко всем четырём таблицам. Если файл отсутствует
+        или повреждён, метод завершается без ошибок. Вызывается при
+        инициализации главного окна.
+        """
+        try:
+            path = os.path.join(self.db_folder, COLUMN_WIDTHS_FILE)
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                widths = json.load(f)
+
+            self._apply_widths(self.smeta_table, widths.get("smeta_table"))
+            self._apply_widths(self.works_table, widths.get("works_table"))
+            self._apply_widths(self.materials_table, widths.get("materials_table"))
+            self._apply_widths(self.links_table, widths.get("links_table"))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _apply_widths(table, widths):
+        """Применяет список ширин к таблице, если количество колонок совпадает.
+        
+        Args:
+            table (QTableWidget): таблица, к которой применяются ширины.
+            widths (list[int] | None): список ширин колонок в пикселях.
+                Если None или длина не совпадает с количеством колонок таблицы,
+                метод завершается без изменений.
+        """
+        if widths is None or len(widths) != table.columnCount():
+            return
+        for col, w in enumerate(widths):
+            try:
+                table.setColumnWidth(col, int(w))
+            except (ValueError, OverflowError):
+                pass
+
+    def _save_window_geometry(self):
+        """Сохраняет размер и позицию главного окна в JSON-файл.
+        
+        Использует QMainWindow.saveGeometry() для сериализации состояния окна
+        (размер, позиция, состояние развёрнутости) и записывает его в hex-строку
+        в файл window_geometry.json в папке базы данных. Вызывается при закрытии
+        окна (closeEvent).
+        """
+        try:
+            geo = self.saveGeometry()
+            path = os.path.join(self.db_folder, "window_geometry.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(geo.data().hex(), f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _load_window_geometry(self):
+        """Загружает размер и позицию главного окна из JSON-файла.
+        
+        Читает hex-строку из файла window_geometry.json и восстанавливает
+        состояние окна через QMainWindow.restoreGeometry(). Если файл
+        отсутствует или повреждён, окно открывается с размером по умолчанию.
+        Вызывается при инициализации главного окна.
+        """
+        try:
+            path = os.path.join(self.db_folder, "window_geometry.json")
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                hex_str = f.read().strip()
+            if not hex_str:
+                return
+            geo_data = bytes.fromhex(hex_str)
+            self.restoreGeometry(geo_data)
+        except Exception:
+            pass
 
     # =======================================================================
     # Справка / Настройки
@@ -1542,6 +1762,8 @@ class SmetaMainWindow(QMainWindow):
     # =======================================================================
     def closeEvent(self, event):
         self._save_draft()
+        self._save_column_widths()
+        self._save_window_geometry()
         if self.db_mgr:
             self.db_mgr.flush()
             self.db_mgr.close()
@@ -1552,7 +1774,7 @@ class SmetaMainWindow(QMainWindow):
 # Точка входа
 # ---------------------------------------------------------------------------
 def main():
-    """Запускает приложение «Сметчик PRO 5.2»."""
+    """Запускает приложение «Сметчик PRO 5.3»."""
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = SmetaMainWindow()

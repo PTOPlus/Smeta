@@ -380,18 +380,21 @@ def parse_exported_sheet(sheet_values):
     """Разбирает ранее экспортированный лист 'Смета' из Excel.
     
     Извлекает название сметы, последовательность работ, а также значения
-    дополнительных расходов: накладные, подъёмные механизмы, вывоз мусора.
+    дополнительных расходов: накладные, подъёмные механизмы, вывоз мусора,
+    бетононасос.
     
     Args:
         sheet_values: двумерный список значений ячеек листа Excel.
         
     Returns:
         dict: словарь с ключами:
-            - title (str): название сметы
-            - overhead (tuple): (В1, В2) накладные расходы
-            - lifting (tuple): (В1, В2) подъёмные механизмы
-            - lifting_trash (tuple): (В1, В2) вывоз мусора
-            - sequence (list): список кортежей ('section', name) или ('work', name, vol)
+            - title (str): название сметы.
+            - overhead (tuple): (В1, В2) накладные расходы.
+            - lifting (tuple): (В1, В2) подъёмные механизмы.
+            - lifting_trash (tuple): (В1, В2) вывоз мусора.
+            - betonopump (tuple): (В1, В2) бетононасос.
+            - sequence (list): список кортежей ('section', name) или 
+                ('work', name, vol).
     """
     import math
     
@@ -399,6 +402,7 @@ def parse_exported_sheet(sheet_values):
     overhead = (0.0, 0.0)
     lifting = (0.0, 0.0)
     lifting_trash = (0.0, 0.0)
+    betonopump = (0.0, 0.0)
     sequence = []
 
     if sheet_values:
@@ -484,6 +488,15 @@ def parse_exported_sheet(sheet_values):
                 pass
             continue
 
+        if "бетононасос" in name.lower():
+            try:
+                val1 = float(row[6]) if len(row) > 6 and not (isinstance(row[6], float) and math.isnan(row[6])) else 0.0
+                val2 = float(row[10]) if len(row) > 10 and not (isinstance(row[10], float) and math.isnan(row[10])) else 0.0
+                betonopump = (val1, val2)
+            except (ValueError, TypeError, IndexError):
+                pass
+            continue
+
         is_numbered = False
         if str0 and str0.replace('.', '').isdigit():
             is_numbered = True
@@ -500,6 +513,7 @@ def parse_exported_sheet(sheet_values):
         'overhead': overhead,
         'lifting': lifting,
         'lifting_trash': lifting_trash,
+        'betonopump': betonopump,
         'sequence': sequence,
     }
 
@@ -508,7 +522,7 @@ def parse_exported_sheet(sheet_values):
 # --------------------------------------------------------------------------
 def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
                           overhead1=0.0, overhead2=0.0, lift1=0.0, lift2=0.0,
-                          trash1=0.0, trash2=0.0):
+                          trash1=0.0, trash2=0.0, betonopump1=0.0, betonopump2=0.0):
     """Выгружает смету в Excel-файл с формулами и форматированием.
     
     Создаёт XLSX-файл с листом 'Смета', содержащим структурированные данные
@@ -519,7 +533,8 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         - Заголовок сметы
         - Шапка с колонками для двух вариантов цен
         - Блоки работ: строка работы → в т.ч. работы/материалы → список материалов
-        - Итоги: работы, материалы, накладные, подъёмные механизмы, вывоз мусора
+        - Итоги: работы, материалы, накладные, подъёмные механизмы, 
+          вывоз мусора, бетононасос
         - Общая сумма с расчётом экономии и соотношения В1/В2
     
     Args:
@@ -527,12 +542,15 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         output_path (str): путь к создаваемому XLSX-файлу.
         title (str): название сметы. По умолчанию "Смета".
         meta_rows (list, optional): список метаданных для листа Meta.
+            Каждая строка — список из 10 значений в формате COLS.
         overhead1 (float): накладные расходы вариант 1.
         overhead2 (float): накладные расходы вариант 2.
         lift1 (float): подъёмные механизмы вариант 1.
         lift2 (float): подъёмные механизмы вариант 2.
         trash1 (float): вывоз мусора вариант 1.
         trash2 (float): вывоз мусора вариант 2.
+        betonopump1 (float): бетононасос вариант 1.
+        betonopump2 (float): бетононасос вариант 2.
         
     Returns:
         str: полный путь к созданному файлу.
@@ -713,6 +731,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     row_overhead = row_total + 3
     row_lifting = row_total + 4
     row_trash = row_total + 5
+    row_betonopump = row_total + 6
 
     works_f1 = "+".join(workonly_total1_refs) if workonly_total1_refs else "0"
     works_f2 = "+".join(workonly_total2_refs) if workonly_total2_refs else "0"
@@ -744,9 +763,14 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     ws.write(row_trash, 10, trash2, f_sub_num)
     ws.write_formula(row_trash, 9, f"=IF({RC(row_trash,6)}=0,0,{RC(row_trash,10)}/{RC(row_trash,6)})", f_ratio)
 
+    ws.write(row_betonopump, 1, "Бетононасос", f_sub_lbl)
+    ws.write(row_betonopump, 6, betonopump1, f_sub_num)
+    ws.write(row_betonopump, 10, betonopump2, f_sub_num)
+    ws.write_formula(row_betonopump, 9, f"=IF({RC(row_betonopump,6)}=0,0,{RC(row_betonopump,10)}/{RC(row_betonopump,6)})", f_ratio)
+
     ws.write(row_total, 1, "ИТОГО:", f_total_lbl)
-    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}+{RC(row_trash,6)}"
-    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}+{RC(row_trash,10)}"
+    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}+{RC(row_trash,6)}+{RC(row_betonopump,6)}"
+    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}+{RC(row_trash,10)}+{RC(row_betonopump,10)}"
     ws.write_formula(row_total, 6, total_f1, f_total_num)
     ws.write_formula(row_total, 10, total_f2, f_total_num)
     ws.write_formula(row_total, 8, f"={RC(row_total,6)}-{RC(row_total,10)}", f_total_num)
