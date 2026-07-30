@@ -2142,26 +2142,23 @@ class SmetaMainWindow(QMainWindow):
     # =======================================================================
     def _show_exit_dialog(self):
         """Показывает диалог выхода с выбором действия."""
-        reply = QMessageBox.question(
-            self, "Выход",
-            "Выберите действие:",
-            QMessageBox.StandardButton.Save |
-            QMessageBox.StandardButton.SaveAll |
-            QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Save,
-        )
-
-        if reply == QMessageBox.StandardButton.Save:
-            # Сохранить смету в Excel-файл
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Выход")
+        msg.setText("Выберите действие:")
+        msg.setIcon(QMessageBox.Icon.Question)
+        
+        btn_save_file = msg.addButton("Сохранить в файл", QMessageBox.ButtonRole.AcceptRole)
+        btn_save_draft = msg.addButton("Сохранить черновик", QMessageBox.ButtonRole.ApplyRole)
+        btn_cancel = msg.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        
+        msg.exec()
+        
+        if msg.clickedButton() == btn_save_file:
             if self._do_export_to_excel():
                 self.close()
-        elif reply == QMessageBox.StandardButton.SaveAll:
-            # Сохранить черновик
+        elif msg.clickedButton() == btn_save_draft:
             self._save_draft()
             self.close()
-        else:
-            # Отмена — ничего не делаем
-            pass
 
     def _do_export_to_excel(self):
         """Выполняет экспорт сметы в Excel без показа диалогов.
