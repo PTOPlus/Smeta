@@ -7,25 +7,23 @@ app.py — Главный модуль приложения «Сметчик PRO
 import os
 import sys
 import json
-import math
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QMessageBox, QFileDialog, QDialog,
-    QFormLayout, QGroupBox, QHeaderView, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QSplitter, QMenuBar, QMenu, QStatusBar, QFrame,
-    QAbstractItemView, QInputDialog, QDialogButtonBox,
+    QFormLayout, QHeaderView, QDoubleSpinBox, QMenu,
+    QAbstractItemView, QInputDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QDate
-from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut, QColor
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut, QColor
 
 from smeta_core import (
     build_work_block, rebuild_smeta, compute_grand_totals,
     export_smeta_to_excel, parse_exported_sheet,
     to_float, is_section, is_work, is_total, is_material, clean_name,
-    SECTION_PREFIX, WORK_PREFIX, MATERIAL_PREFIX, TOTAL_PREFIX,
+    SECTION_PREFIX, WORK_PREFIX, TOTAL_PREFIX,
     CALC_HEADERS, COLS,
 )
 from db_manager import DatabaseManager
@@ -57,6 +55,7 @@ EDITABLE_MAT = {COL_NORM1, COL_PRICE1, COL_NORM2, COL_PRICE2}
 
 # Файл для сохранения ширин колонок
 COLUMN_WIDTHS_FILE = "column_widths.json"
+SETTINGS_FILE = "settings.json"
 
 
 def _cell(value, right_align=False):
@@ -333,12 +332,18 @@ class SmetaMainWindow(QMainWindow):
         self.copied_value = None
         self.copied_row = None
 
+        # --- Настройки (загружаем до создания БД) ---
+        self._load_settings()
+
         # --- БД ---
         os.makedirs(self.db_folder, exist_ok=True)
         self.db_mgr = DatabaseManager(self.db_folder, "smeta_db")
 
         # --- Меню ---
         self._create_menu()
+
+        # --- Загружаем геометрию окна ДО создания центрального виджета ---
+        self._load_window_geometry()
 
         # --- Центральный виджет ---
         central = QWidget()
@@ -362,6 +367,27 @@ class SmetaMainWindow(QMainWindow):
         # --- Статус-бар ---
         self.statusBar().showMessage("Готово")
 
+        # --- Кнопка выхода и дата/время ---
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        
+        self.datetime_label = QLabel()
+        self.datetime_label.setFixedWidth(180)
+        self.datetime_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.datetime_label.setStyleSheet("QLabel { font-size: 12px; color: #555; }")
+        btn_row.addWidget(self.datetime_label)
+        
+        btn_exit = QPushButton("🚪 Выход")
+        btn_exit.setFixedHeight(24)
+        btn_exit.setFixedWidth(80)
+        btn_exit.setStyleSheet("QPushButton { text-align: center; }")
+        btn_exit.clicked.connect(self._show_exit_dialog)
+        btn_row.addWidget(btn_exit)
+        
+        bottom_widget = QWidget()
+        bottom_widget.setLayout(btn_row)
+        main_layout.addWidget(bottom_widget)
+
         # --- Горячие клавиши ---
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
         QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
@@ -370,7 +396,20 @@ class SmetaMainWindow(QMainWindow):
         self._load_draft()
         self._refresh_works_combo()
         self._load_column_widths()
-        self._load_window_geometry()
+
+        # --- Обновление даты/времени ---
+        self._update_datetime()
+        self.datetime_timer = self.startTimer(1000)
+
+    def timerEvent(self, event):
+        """Обновляет метку даты и времени каждую секунду."""
+        if event.timerId() == self.datetime_timer:
+            self._update_datetime()
+
+    def _update_datetime(self):
+        """Обновляет метку с текущими датой и временем."""
+        now = datetime.now()
+        self.datetime_label.setText(now.strftime("%d.%m.%Y %H:%M:%S"))
 
     # =======================================================================
     # Меню
@@ -452,7 +491,7 @@ class SmetaMainWindow(QMainWindow):
         top_row = QHBoxLayout()
         self.title_edit = QLineEdit()
         self.title_edit.setText(self.smeta_title)
-        self.title_edit.setFixedWidth(350)
+        self.title_edit.setFixedWidth(750)
         self.title_edit.textChanged.connect(self._on_title_changed)
         top_row.addWidget(QLabel("Название сметы:"))
         top_row.addWidget(self.title_edit)
@@ -473,7 +512,7 @@ class SmetaMainWindow(QMainWindow):
         # Панель добавления работы
         add_row = QHBoxLayout()
         self.work_combo = QComboBox()
-        self.work_combo.setFixedWidth(350)
+        self.work_combo.setFixedWidth(650)
         self.work_combo.setEditable(True)
         self.work_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.work_combo.currentTextChanged.connect(self._on_work_combo_changed)
@@ -550,13 +589,14 @@ class SmetaMainWindow(QMainWindow):
 
         self.extra_table = QTableWidget()
         self.extra_table.setColumnCount(3)
-        self.extra_table.setHorizontalHeaderLabels(["Затраты", "Стоимость В1", "Стоимость В2"])
+        self.extra_table.setHorizontalHeaderLabels(["Дополнительные затраты", "Стоимость В1", "Стоимость В2"])
         self.extra_table.setRowCount(4)
         self.extra_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.extra_table.verticalHeader().setVisible(False)
         self.extra_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
         self.extra_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.extra_table.horizontalHeader().setStretchLastSection(True)
+        self.extra_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
         self.extra_table.cellDoubleClicked.connect(self._on_extra_cell_double_click)
 
         row_labels = [
@@ -646,6 +686,8 @@ class SmetaMainWindow(QMainWindow):
         self.works_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.works_table.horizontalHeader().setStretchLastSection(True)
         self.works_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
+        self.works_table.cellDoubleClicked.connect(self._on_works_double_click)
+        self.works_table.itemChanged.connect(self._on_work_item_changed)
         layout.addWidget(self.works_table)
 
         form = QFormLayout()
@@ -697,6 +739,8 @@ class SmetaMainWindow(QMainWindow):
         self.materials_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.materials_table.horizontalHeader().setStretchLastSection(True)
         self.materials_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
+        self.materials_table.cellDoubleClicked.connect(self._on_materials_double_click)
+        self.materials_table.itemChanged.connect(self._on_material_item_changed)
         layout.addWidget(self.materials_table)
 
         form = QFormLayout()
@@ -739,14 +783,16 @@ class SmetaMainWindow(QMainWindow):
         layout.addLayout(combo_row)
 
         self.links_table = QTableWidget()
-        self.links_table.setColumnCount(6)
-        self.links_table.setHorizontalHeaderLabels(["Материал", "Ед. изм.", "Расход В1", "Расход В2", "Цена В1", "Цена В2"])
+        self.links_table.setColumnCount(7)
+        self.links_table.setHorizontalHeaderLabels(["Материал", "Ед. изм.", "Расход В1", "Расход В2", "Цена В1", "Цена В2", "Окр. ↑"])
         self.links_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.links_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.links_table.verticalHeader().setVisible(False)
         self.links_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
         self.links_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.links_table.horizontalHeader().setStretchLastSection(True)
         self.links_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
+        self.links_table.itemChanged.connect(self._on_link_item_changed)
         layout.addWidget(self.links_table)
 
         btn_row = QHBoxLayout()
@@ -763,15 +809,18 @@ class SmetaMainWindow(QMainWindow):
     # РАБОТЫ: refresh, filter, CRUD
     # =======================================================================
     def _refresh_works_table(self):
+        self.works_table.blockSignals(True)
         df = self.db_mgr.get_works()
         self.works_table.setRowCount(len(df))
         for i, row in df.iterrows():
-            self.works_table.setItem(i, 0, QTableWidgetItem(str(int(row['id']))))
+            item_id = QTableWidgetItem(str(int(row['id'])))
+            item_id.setFlags(item_id.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.works_table.setItem(i, 0, item_id)
             self.works_table.setItem(i, 1, QTableWidgetItem(str(row['name'])))
             self.works_table.setItem(i, 2, QTableWidgetItem(str(row['unit'])))
             self.works_table.setItem(i, 3, _cell(row['price_1'], True))
             self.works_table.setItem(i, 4, _cell(row['price_2'], True))
-        self.works_table.cellDoubleClicked.connect(self._on_works_double_click)
+        self.works_table.blockSignals(False)
 
     def _filter_works(self):
         q = self.works_filter_edit.text().strip().lower()
@@ -790,6 +839,41 @@ class SmetaMainWindow(QMainWindow):
         self.ref_work_unit.setText(str(rd['unit']))
         self.ref_work_price1.setValue(float(rd['price_1']))
         self.ref_work_price2.setValue(float(rd['price_2']))
+
+    def _on_work_item_changed(self, item):
+        """Сохраняет изменения ячейки таблицы работ в БД."""
+        row = item.row()
+        col = item.column()
+        if col == 0:
+            return  # ID не редактируется
+        df = self.db_mgr.get_works()
+        if df.empty or row >= len(df):
+            return
+        wid = int(df.iloc[row]['id'])
+        val = item.text().strip()
+
+        try:
+            if col == 1:
+                if val:
+                    self.db_mgr.update_work(wid, name=val)
+            elif col == 2:
+                self.db_mgr.update_work(wid, unit=val)
+            elif col == 3:
+                self.db_mgr.update_work(wid, price_1=to_float(val))
+                # Форматируем отображение
+                self.works_table.blockSignals(True)
+                self.works_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.works_table.blockSignals(False)
+            elif col == 4:
+                self.db_mgr.update_work(wid, price_2=to_float(val))
+                self.works_table.blockSignals(True)
+                self.works_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.works_table.blockSignals(False)
+            self.db_mgr.flush()
+            self._refresh_works_combo()
+            self._refresh_link_works_combo()
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка сохранения: {e}")
 
     def _add_work(self):
         name = self.ref_work_name.text().strip()
@@ -857,15 +941,18 @@ class SmetaMainWindow(QMainWindow):
     # МАТЕРИАЛЫ: refresh, filter, CRUD
     # =======================================================================
     def _refresh_materials_table(self):
+        self.materials_table.blockSignals(True)
         df = self.db_mgr.get_materials()
         self.materials_table.setRowCount(len(df))
         for i, row in df.iterrows():
-            self.materials_table.setItem(i, 0, QTableWidgetItem(str(int(row['id']))))
+            item_id = QTableWidgetItem(str(int(row['id'])))
+            item_id.setFlags(item_id.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.materials_table.setItem(i, 0, item_id)
             self.materials_table.setItem(i, 1, QTableWidgetItem(str(row['name'])))
             self.materials_table.setItem(i, 2, QTableWidgetItem(str(row['unit'])))
             self.materials_table.setItem(i, 3, _cell(row['price_1'], True))
             self.materials_table.setItem(i, 4, _cell(row['price_2'], True))
-        self.materials_table.cellDoubleClicked.connect(self._on_materials_double_click)
+        self.materials_table.blockSignals(False)
 
     def _filter_materials(self):
         q = self.materials_filter_edit.text().strip().lower()
@@ -884,6 +971,38 @@ class SmetaMainWindow(QMainWindow):
         self.ref_mat_unit.setText(str(rd['unit']))
         self.ref_mat_price1.setValue(float(rd['price_1']))
         self.ref_mat_price2.setValue(float(rd['price_2']))
+
+    def _on_material_item_changed(self, item):
+        """Сохраняет изменения ячейки таблицы материалов в БД."""
+        row = item.row()
+        col = item.column()
+        if col == 0:
+            return
+        df = self.db_mgr.get_materials()
+        if df.empty or row >= len(df):
+            return
+        mid = int(df.iloc[row]['id'])
+        val = item.text().strip()
+
+        try:
+            if col == 1:
+                if val:
+                    self.db_mgr.update_material(mid, name=val)
+            elif col == 2:
+                self.db_mgr.update_material(mid, unit=val)
+            elif col == 3:
+                self.db_mgr.update_material(mid, price_1=to_float(val))
+                self.materials_table.blockSignals(True)
+                self.materials_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.materials_table.blockSignals(False)
+            elif col == 4:
+                self.db_mgr.update_material(mid, price_2=to_float(val))
+                self.materials_table.blockSignals(True)
+                self.materials_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.materials_table.blockSignals(False)
+            self.db_mgr.flush()
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка сохранения: {e}")
 
     def _add_material(self):
         name = self.ref_mat_name.text().strip()
@@ -958,34 +1077,93 @@ class SmetaMainWindow(QMainWindow):
         self.link_work_combo.blockSignals(False)
 
     def _refresh_links_table(self):
+        self.links_table.blockSignals(True)
         wn = self.link_work_combo.currentText().strip()
         if not wn:
             self.links_table.setRowCount(0)
+            self.links_table.blockSignals(False)
             return
         wd = self.db_mgr.get_work_with_materials(wn)
         if wd is None:
             self.links_table.setRowCount(0)
+            self.links_table.blockSignals(False)
             return
         mats = wd['materials']
         self.links_table.setRowCount(len(mats))
         for i, m in enumerate(mats):
-            self.links_table.setItem(i, 0, QTableWidgetItem(m['name']))
-            self.links_table.setItem(i, 1, QTableWidgetItem(m['unit']))
+            item_name = QTableWidgetItem(m['name'])
+            item_name.setFlags(item_name.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.links_table.setItem(i, 0, item_name)
+            item_unit = QTableWidgetItem(m['unit'])
+            item_unit.setFlags(item_unit.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.links_table.setItem(i, 1, item_unit)
             self.links_table.setItem(i, 2, _cell(m['consumption_1'], True))
             self.links_table.setItem(i, 3, _cell(m['consumption_2'], True))
             self.links_table.setItem(i, 4, _cell(m['price_1'], True))
             self.links_table.setItem(i, 5, _cell(m['price_2'], True))
-        self.links_table.cellDoubleClicked.connect(self._on_link_double_click)
+            item_round = QTableWidgetItem()
+            item_round.setFlags(item_round.flags() & ~Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsUserCheckable)
+            item_round.setCheckState(Qt.CheckState.Checked if m.get('round_up', False) else Qt.CheckState.Unchecked)
+            self.links_table.setItem(i, 6, item_round)
+        self.links_table.blockSignals(False)
 
-    def _on_link_double_click(self, row, col):
-        if col not in (2, 3):
+    def _on_link_item_changed(self, item):
+        """Сохраняет изменения ячейки таблицы связей в БД.
+
+        Колонки 2-3 (расход) сохраняются в связь work_materials.
+        Колонки 4-5 (цена) сохраняются в карточку материала.
+        Колонка 6 (чекбокс) — округление объёма вверх до целого.
+        """
+        row = item.row()
+        col = item.column()
+        if col in (0, 1):
             return
-        cur = self.links_table.item(row, col).text()
-        val, ok = QInputDialog.getDouble(self, "Изменение расхода", "Введите новое значение:",
-                                          float(cur) if cur and cur != "-" else 0.0,
-                                          0.0, 999999, 3)
-        if ok:
-            self.links_table.setItem(row, col, _cell(val, True))
+
+        wn = self.link_work_combo.currentText().strip()
+        mn = self.links_table.item(row, 0).text() if self.links_table.item(row, 0) else ""
+        if not wn or not mn:
+            return
+
+        work = self.db_mgr.get_work_by_name(wn)
+        mat = self.db_mgr.get_material_by_name(mn)
+        if work is None or mat is None:
+            return
+
+        work_id = int(work['id'])
+        mat_id = int(mat['id'])
+
+        try:
+            if col == 6:
+                # Чекбокс округления
+                round_up = item.checkState() == Qt.CheckState.Checked
+                cons1 = to_float(self.links_table.item(row, 2).text())
+                cons2 = to_float(self.links_table.item(row, 3).text())
+                self.db_mgr.add_work_material_link(work_id, mat_id, cons1, cons2, round_up)
+                self.db_mgr.flush()
+                self.statusBar().showMessage(f"Округление {'вкл' if round_up else 'выкл'}: {mn}")
+                return
+
+            val = to_float(item.text())
+
+            if col == 2:
+                self.db_mgr.add_work_material_link(work_id, mat_id, val,
+                                                    to_float(self.links_table.item(row, 3).text()))
+            elif col == 3:
+                self.db_mgr.add_work_material_link(work_id, mat_id,
+                                                    to_float(self.links_table.item(row, 2).text()), val)
+            elif col == 4:
+                self.db_mgr.update_material(mat_id, price_1=val)
+            elif col == 5:
+                self.db_mgr.update_material(mat_id, price_2=val)
+
+            # Форматируем отображение
+            self.links_table.blockSignals(True)
+            item.setText(f"{val:.2f}" if col in (4, 5) else f"{val:.3f}")
+            self.links_table.blockSignals(False)
+
+            self.db_mgr.flush()
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка сохранения: {e}")
 
     def _add_link(self):
         wn = self.link_work_combo.currentText().strip()
@@ -1272,15 +1450,137 @@ class SmetaMainWindow(QMainWindow):
     # Контекстное меню
     # =======================================================================
     def _show_table_context_menu(self, pos):
-        menu = self.smeta_table.createStandardContextMenu()
-        menu.addSeparator()
+        menu = QMenu(self)
         act_copy = QAction("📋 Копировать", self)
         act_copy.triggered.connect(self._copy_cell)
         menu.addAction(act_copy)
         act_paste = QAction("📌 Вставить", self)
         act_paste.triggered.connect(self._paste_cell)
         menu.addAction(act_paste)
+        menu.addSeparator()
+        act_delete = QAction("🗑 Удалить", self)
+        act_delete.triggered.connect(self._delete_selected_rows)
+        menu.addAction(act_delete)
+
+        # Пункты создания разделов
+        sel = self.smeta_table.selectionModel().selectedRows()
+        if sel:
+            r = sel[0].row()
+            if 0 <= r < len(self.smeta_rows):
+                row_name = str(self.smeta_rows[r][1]).strip()
+
+                # «Создать раздел выше» — можно в начале сметы, над работой, над разделом, над итогом
+                can_insert_above = self._can_insert_section_above(r)
+                act_above = QAction("📑 Создать раздел выше", self)
+                act_above.setEnabled(can_insert_above)
+                act_above.triggered.connect(lambda: self._create_section_above(r))
+                menu.addAction(act_above)
+
+                # «Создать раздел ниже» — можно после раздела, после работы (без материалов), после итога
+                can_insert_below = self._can_insert_section_below(r)
+                act_below = QAction("📑 Создать раздел ниже", self)
+                act_below.setEnabled(can_insert_below)
+                act_below.triggered.connect(lambda: self._create_section_below(r))
+                menu.addAction(act_below)
+
         menu.exec(self.smeta_table.viewport().mapToGlobal(pos))
+
+    def _can_insert_section_above(self, row: int) -> bool:
+        """Проверяет, можно ли вставить раздел выше строки.
+
+        Можно в начале сметы, над строкой раздела, над строкой работы,
+        над строкой ИТОГО ПО УЗЛУ.
+        Нельзя в середине блока работы (над материалом).
+        """
+        if row < 0 or row >= len(self.smeta_rows):
+            return False
+
+        name = str(self.smeta_rows[row][1]).strip()
+
+        # Начало сметы — всегда можно
+        if row == 0:
+            return True
+
+        # Над разделом, работой, итогом — можно
+        if is_section(name) or is_work(name) or is_total(name):
+            return True
+
+        # Над материалом — нельзя (середина блока)
+        return False
+
+    def _can_insert_section_below(self, row: int) -> bool:
+        """Проверяет, можно ли вставить раздел ниже строки.
+
+        Можно после раздела, после итога, после работы (если за ней нет
+        материалов — работа без материалов или последний блок).
+        Нельзя после материала (середина блока).
+        """
+        if row < 0 or row >= len(self.smeta_rows):
+            return False
+
+        name = str(self.smeta_rows[row][1]).strip()
+
+        # После раздела или итога — всегда можно
+        if is_section(name) or is_total(name):
+            return True
+
+        # После работы — можно только если за ней нет материалов
+        if is_work(name):
+            next_row = row + 1
+            # Если это последняя строка — можно
+            if next_row >= len(self.smeta_rows):
+                return True
+            next_name = str(self.smeta_rows[next_row][1]).strip()
+            # Если следующая строка — раздел, итог или конец — можно
+            if not is_material(next_name):
+                return True
+            # Если следующая — материал, значит работа с материалами — нельзя
+            return False
+
+        # После материала — нельзя (середина блока)
+        return False
+
+    def _create_section_above(self, row: int):
+        """Создаёт новый раздел выше указанной строки."""
+        name, ok = QInputDialog.getText(
+            self, "Новый раздел",
+            "Название нового раздела:",
+            QLineEdit.EchoMode.Normal,
+            "",
+            flags=Qt.WindowType.Window,
+            inputMethodHints=Qt.InputMethodHint.ImhNone,
+        )
+        if not ok or not name.strip():
+            return
+
+        self._push_undo_state()
+        section_row = ("", f"{SECTION_PREFIX}{name.strip()}", "", "", "", "", "", "", "", "", "")
+        self.smeta_rows.insert(row, section_row)
+        self.smeta_rows = rebuild_smeta(self.smeta_rows)
+        self._update_table_from_rows()
+        self._save_draft()
+        self.statusBar().showMessage(f"Раздел создан выше строки {row + 1}")
+
+    def _create_section_below(self, row: int):
+        """Создаёт новый раздел ниже указанной строки."""
+        name, ok = QInputDialog.getText(
+            self, "Новый раздел",
+            "Название нового раздела:",
+            QLineEdit.EchoMode.Normal,
+            "",
+            flags=Qt.WindowType.Window,
+            inputMethodHints=Qt.InputMethodHint.ImhNone,
+        )
+        if not ok or not name.strip():
+            return
+
+        self._push_undo_state()
+        section_row = ("", f"{SECTION_PREFIX}{name.strip()}", "", "", "", "", "", "", "", "", "")
+        self.smeta_rows.insert(row + 1, section_row)
+        self.smeta_rows = rebuild_smeta(self.smeta_rows)
+        self._update_table_from_rows()
+        self._save_draft()
+        self.statusBar().showMessage(f"Раздел создан ниже строки {row + 1}")
 
     def _copy_cell(self):
         sel = self.smeta_table.selectedItems()
@@ -1309,6 +1609,48 @@ class SmetaMainWindow(QMainWindow):
         self.smeta_rows = rebuild_smeta(self.smeta_rows)
         self._update_table_from_rows()
         self._save_draft()
+
+    def _delete_selected_rows(self):
+        """Удаляет выделенные строки из сметы с пересчётом.
+
+        Если выделена работа — удаляются также все её материалы и строка
+        «ИТОГО ПО УЗЛУ». Если выделен только материал — удаляется только он.
+        Разделы и итоговые строки удаляются по отдельности.
+        """
+        selected = {idx.row() for idx in self.smeta_table.selectionModel().selectedRows()}
+        if not selected:
+            return
+
+        self._push_undo_state()
+
+        # Расширяем набор: для каждой выделенной работы добавляем её материалы и итог
+        to_delete = set(selected)
+        for row in sorted(selected):
+            if row >= len(self.smeta_rows):
+                continue
+            name = str(self.smeta_rows[row][1]).strip()
+            if is_work(name):
+                r = row + 1
+                while r < len(self.smeta_rows):
+                    rname = str(self.smeta_rows[r][1]).strip()
+                    if is_material(rname):
+                        to_delete.add(r)
+                        r += 1
+                    elif is_total(rname):
+                        to_delete.add(r)
+                        break
+                    else:
+                        break
+
+        # Удаляем строки с конца, чтобы не сбивать индексы
+        for row in sorted(to_delete, reverse=True):
+            if row < len(self.smeta_rows):
+                self.smeta_rows.pop(row)
+
+        self.smeta_rows = rebuild_smeta(self.smeta_rows)
+        self._update_table_from_rows()
+        self._save_draft()
+        self.statusBar().showMessage(f"Удалено строк: {len(to_delete)}")
 
     # =======================================================================
     # Undo / Redo
@@ -1435,33 +1777,11 @@ class SmetaMainWindow(QMainWindow):
     # Экспорт / Импорт
     # =======================================================================
     def _export_to_excel(self):
-        if not self.smeta_rows:
-            QMessageBox.warning(self, "Ошибка", "Смета пуста.")
+        """Открывает диалог сохранения сметы в Excel."""
+        if not self._do_export_to_excel():
             return
-        os.makedirs(self.export_folder, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{self.smeta_title}_{ts}.xlsx"
-        path = os.path.join(self.export_folder, filename)
-        try:
-            meta_rows = []
-            for row in self.smeta_rows:
-                if is_work(row[1]):
-                    # 11 колонок → 10 колонок COLS: ['Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм', 'Расход_1', 'Цена_мат_1', 'Цена_раб_1', 'Расход_2', 'Цена_мат_2', 'Цена_раб_2']
-                    meta_rows.append([clean_name(row[1]), row[2], "-", "-", "-", 0, row[5], "-", 0, row[9]])
-                elif is_material(row[1]):
-                    meta_rows.append(["-", "-", clean_name(row[1]), row[2], row[3], row[5], 0, row[7], row[9], 0])
-            export_smeta_to_excel(
-                rows=self.smeta_rows, output_path=path,
-                title=self.smeta_title, meta_rows=meta_rows,
-                overhead1=self.extra_overhead1, overhead2=self.extra_overhead2,
-                lift1=self.extra_lifting1, lift2=self.extra_lifting2,
-                trash1=self.extra_trash1, trash2=self.extra_trash2,
-                betonopump1=self.extra_betonopump1, betonopump2=self.extra_betonopump2,
-            )
-            self.statusBar().showMessage(f"Экспорт: {path}")
-            QMessageBox.information(self, "Экспорт", f"Смета экспортирована:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка экспорта", str(e))
+        self.statusBar().showMessage("Экспорт завершён")
+        QMessageBox.information(self, "Экспорт", "Смета экспортирована успешно.")
 
     def _import_from_excel(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1520,6 +1840,19 @@ class SmetaMainWindow(QMainWindow):
             QMessageBox.information(self, "Импорт", f"Смета импортирована:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка импорта", str(e))
+
+    # =======================================================================
+    # Закрытие
+    # =======================================================================
+    def closeEvent(self, event):
+        self._save_draft()
+        self._save_column_widths()
+        self._save_window_geometry()
+        self._save_settings()
+        if self.db_mgr:
+            self.db_mgr.flush()
+            self.db_mgr.close()
+        event.accept()
 
     # =======================================================================
     # Слоты
@@ -1615,10 +1948,10 @@ class SmetaMainWindow(QMainWindow):
     def _save_column_widths(self):
         """Сохраняет ширины колонок всех таблиц в JSON-файл.
         
-        Собирает текущие ширины колонок четырёх таблиц (smeta_table, works_table,
-        materials_table, links_table) и записывает их в файл column_widths.json
-        в папке базы данных. Вызывается при изменении ширины любой колонки
-        (сигнал sectionResized) и при закрытии окна.
+        Собирает текущие ширины колонок пяти таблиц (smeta_table, works_table,
+        materials_table, links_table, extra_table) и записывает их в файл
+        column_widths.json в папке базы данных. Вызывается при изменении ширины
+        любой колонки (сигнал sectionResized) и при закрытии окна.
         """
         try:
             widths = {
@@ -1626,6 +1959,7 @@ class SmetaMainWindow(QMainWindow):
                 "works_table": [self.works_table.columnWidth(c) for c in range(self.works_table.columnCount())],
                 "materials_table": [self.materials_table.columnWidth(c) for c in range(self.materials_table.columnCount())],
                 "links_table": [self.links_table.columnWidth(c) for c in range(self.links_table.columnCount())],
+                "extra_table": [self.extra_table.columnWidth(c) for c in range(self.extra_table.columnCount())],
             }
             path = os.path.join(self.db_folder, COLUMN_WIDTHS_FILE)
             with open(path, "w", encoding="utf-8") as f:
@@ -1637,7 +1971,7 @@ class SmetaMainWindow(QMainWindow):
         """Загружает ширины колонок всех таблиц из JSON-файла.
         
         Читает файл column_widths.json из папки базы данных и применяет
-        сохранённые ширины ко всем четырём таблицам. Если файл отсутствует
+        сохранённые ширины ко всем пяти таблицам. Если файл отсутствует
         или повреждён, метод завершается без ошибок. Вызывается при
         инициализации главного окна.
         """
@@ -1652,6 +1986,7 @@ class SmetaMainWindow(QMainWindow):
             self._apply_widths(self.works_table, widths.get("works_table"))
             self._apply_widths(self.materials_table, widths.get("materials_table"))
             self._apply_widths(self.links_table, widths.get("links_table"))
+            self._apply_widths(self.extra_table, widths.get("extra_table"))
         except Exception:
             pass
 
@@ -1711,6 +2046,50 @@ class SmetaMainWindow(QMainWindow):
             pass
 
     # =======================================================================
+    # Сохранение / Загрузка настроек
+    # =======================================================================
+    def _load_settings(self):
+        """Загружает настройки приложения из JSON-файла в рабочей папке.
+        
+        Читает файл settings.json и восстанавливает пути к папкам базы данных
+        и экспорта, а также коэффициент цены В1 от В2.
+        Вызывается при инициализации главного окна до создания БД.
+        """
+        try:
+            path = os.path.join(os.getcwd(), SETTINGS_FILE)
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            if "db_folder" in settings:
+                self.db_folder = settings["db_folder"]
+            if "export_folder" in settings:
+                self.export_folder = settings["export_folder"]
+            if "koeff_price" in settings:
+                self.koeff_price = settings["koeff_price"]
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        """Сохраняет настройки приложения в JSON-файл в рабочей папке.
+        
+        Записывает текущие значения db_folder, export_folder и koeff_price
+        в файл settings.json. Вызывается после сохранения настроек в диалоге
+        и при закрытии окна.
+        """
+        try:
+            settings = {
+                "db_folder": self.db_folder,
+                "export_folder": self.export_folder,
+                "koeff_price": self.koeff_price,
+            }
+            path = os.path.join(os.getcwd(), SETTINGS_FILE)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # =======================================================================
     # Справка / Настройки
     # =======================================================================
     def _show_about(self):
@@ -1718,7 +2097,7 @@ class SmetaMainWindow(QMainWindow):
             self, "О программе — Сметчик PRO 5.3",
             "Сметчик PRO 5.3\n\n"
             "Приложение для составления смет с поддержкой двух вариантов цены.\n\n"
-            "Автор: pto_plus | Лицензия: MIT\n\n"
+            "Автор: Крезуб Павел (@pto_plus) | Лицензия: MIT\n\n"
             "Технологии: Python 3, PyQt6, SQLite, pandas, openpyxl, xlsxwriter\n\n"
             "Функционал:\n"
             "• Справочник работ и материалов с ценами В1 и В2\n"
@@ -1739,8 +2118,8 @@ class SmetaMainWindow(QMainWindow):
             "Ctrl+W — Добавить работу\n"
             "Ctrl+D — Добавить раздел\n"
             "Ctrl+Q — Выход\n\n"
-            "Документация: https://docs.kodacode.ru\n"
-            "Сообщество: https://t.me/kodacommunity",
+            "Документация: https://gitflic.ru/project/pto_plus/smeta/blob/raw?file=README.md\n"
+            "Обратная связь: vremyanca@list.ru",
         )
 
     def show_settings(self):
@@ -1755,19 +2134,134 @@ class SmetaMainWindow(QMainWindow):
             if export:
                 self.export_folder = export
             self.koeff_price = koeff
+            self._save_settings()
             self.statusBar().showMessage("Настройки сохранены")
 
     # =======================================================================
     # Закрытие
     # =======================================================================
-    def closeEvent(self, event):
-        self._save_draft()
-        self._save_column_widths()
-        self._save_window_geometry()
-        if self.db_mgr:
-            self.db_mgr.flush()
-            self.db_mgr.close()
-        event.accept()
+    def _show_exit_dialog(self):
+        """Показывает диалог выхода с выбором действия."""
+        reply = QMessageBox.question(
+            self, "Выход",
+            "Выберите действие:",
+            QMessageBox.StandardButton.Save |
+            QMessageBox.StandardButton.SaveAll |
+            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+
+        if reply == QMessageBox.StandardButton.Save:
+            # Сохранить смету в Excel-файл
+            if self._do_export_to_excel():
+                self.close()
+        elif reply == QMessageBox.StandardButton.SaveAll:
+            # Сохранить черновик
+            self._save_draft()
+            self.close()
+        else:
+            # Отмена — ничего не делаем
+            pass
+
+    def _do_export_to_excel(self):
+        """Выполняет экспорт сметы в Excel без показа диалогов.
+        
+        Returns:
+            bool: True если экспорт успешен, False если смета пуста или ошибка.
+        """
+        if not self.smeta_rows:
+            QMessageBox.warning(self, "Ошибка", "Смета пуста.")
+            return False
+        
+        os.makedirs(self.export_folder, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.smeta_title}_{ts}.xlsx"
+        path = os.path.join(self.export_folder, filename)
+        try:
+            meta_rows = []
+            for row in self.smeta_rows:
+                if is_work(row[1]):
+                    meta_rows.append([clean_name(row[1]), row[2], "-", "-", "-", 0, row[5], "-", 0, row[9]])
+                elif is_material(row[1]):
+                    meta_rows.append(["-", "-", clean_name(row[1]), row[2], row[3], row[5], 0, row[7], row[9], 0])
+            export_smeta_to_excel(
+                rows=self.smeta_rows, output_path=path,
+                title=self.smeta_title, meta_rows=meta_rows,
+                overhead1=self.extra_overhead1, overhead2=self.extra_overhead2,
+                lift1=self.extra_lifting1, lift2=self.extra_lifting2,
+                trash1=self.extra_trash1, trash2=self.extra_trash2,
+                betonopump1=self.extra_betonopump1, betonopump2=self.extra_betonopump2,
+            )
+            self.statusBar().showMessage(f"Экспорт: {path}")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка экспорта", str(e))
+            return False
+
+    def _export_to_excel(self):
+        """Открывает диалог сохранения сметы в Excel."""
+        if not self._do_export_to_excel():
+            return
+        self.statusBar().showMessage("Экспорт завершён")
+        QMessageBox.information(self, "Экспорт", "Смета экспортирована успешно.")
+
+    def _import_from_excel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл Excel", self.export_folder, "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, data_only=True)
+            if "Смета" not in wb.sheetnames:
+                QMessageBox.warning(self, "Ошибка", "Нет листа 'Смета'.")
+                return
+            ws = wb["Смета"]
+            values = [list(row) for row in ws.iter_rows(values_only=True)]
+            parsed = parse_exported_sheet(values)
+            seq = parsed['sequence']
+            if not seq:
+                QMessageBox.warning(self, "Ошибка", "Не удалось распознать строки сметы.")
+                return
+
+            self.smeta_rows = []
+            self.sections = []
+            self.smeta_title = parsed['title'] if parsed['title'] else "Смета"
+            self.title_edit.setText(self.smeta_title)
+
+            self.extra_overhead1 = self.extra_overhead2 = 0.0
+            self.extra_lifting1 = self.extra_lifting2 = 0.0
+            self.extra_trash1 = self.extra_trash2 = 0.0
+            self.extra_betonopump1 = self.extra_betonopump2 = 0.0
+            self.extra_overhead1, self.extra_overhead2 = parsed['overhead']
+            self.extra_lifting1, self.extra_lifting2 = parsed['lifting']
+            self.extra_trash1, self.extra_trash2 = parsed['lifting_trash']
+            if 'betonopump' in parsed:
+                self.extra_betonopump1, self.extra_betonopump2 = parsed['betonopump']
+            self._update_extra_table()
+
+            for item in seq:
+                if item[0] == 'section':
+                    self.sections.append(item[1])
+                elif item[0] == 'work':
+                    block = build_work_block(item[1], item[2], None, len(self.smeta_rows) + 1, self.db_mgr)
+                    if block:
+                        self.smeta_rows.extend(block)
+
+            self.smeta_rows = rebuild_smeta(self.smeta_rows)
+            self._update_table_from_rows()
+            self._save_draft()
+
+            self._refresh_works_table()
+            self._refresh_materials_table()
+            self._refresh_works_combo()
+            self._refresh_link_works_combo()
+
+            self.statusBar().showMessage(f"Импорт: {path}")
+            QMessageBox.information(self, "Импорт", f"Смета импортирована:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка импорта", str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -1778,6 +2272,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = SmetaMainWindow()
+    window.setWindowIcon(QIcon('smeta-icon.png'))
     window.show()
     sys.exit(app.exec())
 

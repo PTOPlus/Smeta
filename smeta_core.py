@@ -202,9 +202,16 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
             price_m1 = to_float(mat['price_1'])
             rashod2 = to_float(mat['consumption_2'])
             price_m2 = to_float(mat['price_2'])
+            round_up = bool(mat.get('round_up', False))
             
-            qty1 = round(rashod1 * vol, 3)
-            qty2 = round(rashod2 * vol, 3)
+            qty1 = rashod1 * vol
+            qty2 = rashod2 * vol
+            if round_up:
+                qty1 = math.ceil(qty1)
+                qty2 = math.ceil(qty2)
+            else:
+                qty1 = round(qty1, 3)
+                qty2 = round(qty2, 3)
             cost1 = round(qty1 * price_m1, 2)
             cost2 = round(qty2 * price_m2, 2)
             
@@ -213,7 +220,7 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
             
             rows.append(("", f"{MATERIAL_PREFIX}{mat_name}", str(mat['unit']), 
                         rashod1, qty1, price_m1, cost1,
-                        rashod2, qty2, price_m2, cost2))
+                        rashod2, qty2, price_m2, cost2, round_up))
         
         combined1 = round(work_cost1 + mat_total1, 2)
         combined2 = round(work_cost2 + mat_total2, 2)
@@ -338,14 +345,24 @@ def rebuild_smeta(rows):
             # 100, а не оставаться на 20.
             norm1 = to_float(vals[3])
             norm2 = to_float(vals[7])
-            vals[4] = round(norm1 * work_vol, 3)
-            vals[8] = round(norm2 * work_vol, 3)
+            round_up = bool(len(vals) > 11 and vals[11])
+
+            qty1 = norm1 * work_vol
+            qty2 = norm2 * work_vol
+            if round_up:
+                qty1 = math.ceil(qty1)
+                qty2 = math.ceil(qty2)
+            else:
+                qty1 = round(qty1, 3)
+                qty2 = round(qty2, 3)
+            vals[4] = qty1
+            vals[8] = qty2
 
             price1 = to_float(vals[5])
             price2 = to_float(vals[9])
             vals[0] = ""
-            vals[6] = round(vals[4] * price1, 2)
-            vals[10] = round(vals[8] * price2, 2)
+            vals[6] = round(qty1 * price1, 2)
+            vals[10] = round(qty2 * price2, 2)
             node_mat_cost1 += vals[6]
             node_mat_cost2 += vals[10]
             out.append(tuple(vals))
@@ -696,16 +713,23 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
                 unit_m = str(mvals[2])
                 norm1 = to_float(mvals[3])
                 norm2 = to_float(mvals[7])
+                round_up = bool(len(mvals) > 11 and mvals[11])
 
                 ws.write_blank(r, 0, None, f_blank)
                 ws.write(r, 1, mat_name, f_mat_txt)
                 ws.write(r, 2, unit_m, f_mat_txt)
                 ws.write(r, 3, norm1, f_mat_num)
-                ws.write_formula(r, 4, f"={RC(r, 3)}*{RC(row_top, 4)}", f_mat_num)
+                if round_up:
+                    ws.write_formula(r, 4, f"=ROUNDUP({RC(r, 3)}*{RC(row_top, 4)},0)", f_mat_num)
+                else:
+                    ws.write_formula(r, 4, f"={RC(r, 3)}*{RC(row_top, 4)}", f_mat_num)
                 price_cell(seen_mat1, mat_name, r, 5, to_float(mvals[5]), f_mat_num)
                 ws.write_formula(r, 6, f"={RC(r, 4)}*{RC(r, 5)}", f_mat_num)
                 ws.write(r, 7, norm2, f_mat_num)
-                ws.write_formula(r, 8, f"={RC(r, 7)}*{RC(row_top, 8)}", f_mat_num)
+                if round_up:
+                    ws.write_formula(r, 8, f"=ROUNDUP({RC(r, 7)}*{RC(row_top, 8)},0)", f_mat_num)
+                else:
+                    ws.write_formula(r, 8, f"={RC(r, 7)}*{RC(row_top, 8)}", f_mat_num)
                 price_cell(seen_mat2, mat_name, r, 9, to_float(mvals[9]), f_mat_num)
                 ws.write_formula(r, 10, f"={RC(r, 8)}*{RC(r, 9)}", f_mat_num)
 
