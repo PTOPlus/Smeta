@@ -202,9 +202,16 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
             price_m1 = to_float(mat['price_1'])
             rashod2 = to_float(mat['consumption_2'])
             price_m2 = to_float(mat['price_2'])
+            round_up = bool(mat.get('round_up', False))
             
-            qty1 = round(rashod1 * vol, 3)
-            qty2 = round(rashod2 * vol, 3)
+            qty1 = rashod1 * vol
+            qty2 = rashod2 * vol
+            if round_up:
+                qty1 = math.ceil(qty1)
+                qty2 = math.ceil(qty2)
+            else:
+                qty1 = round(qty1, 3)
+                qty2 = round(qty2, 3)
             cost1 = round(qty1 * price_m1, 2)
             cost2 = round(qty2 * price_m2, 2)
             
@@ -213,7 +220,7 @@ def build_work_block(work_name, vol, db, next_num, db_manager=None):
             
             rows.append(("", f"{MATERIAL_PREFIX}{mat_name}", str(mat['unit']), 
                         rashod1, qty1, price_m1, cost1,
-                        rashod2, qty2, price_m2, cost2))
+                        rashod2, qty2, price_m2, cost2, round_up))
         
         combined1 = round(work_cost1 + mat_total1, 2)
         combined2 = round(work_cost2 + mat_total2, 2)
@@ -338,14 +345,24 @@ def rebuild_smeta(rows):
             # 100, а не оставаться на 20.
             norm1 = to_float(vals[3])
             norm2 = to_float(vals[7])
-            vals[4] = round(norm1 * work_vol, 3)
-            vals[8] = round(norm2 * work_vol, 3)
+            round_up = bool(len(vals) > 11 and vals[11])
+
+            qty1 = norm1 * work_vol
+            qty2 = norm2 * work_vol
+            if round_up:
+                qty1 = math.ceil(qty1)
+                qty2 = math.ceil(qty2)
+            else:
+                qty1 = round(qty1, 3)
+                qty2 = round(qty2, 3)
+            vals[4] = qty1
+            vals[8] = qty2
 
             price1 = to_float(vals[5])
             price2 = to_float(vals[9])
             vals[0] = ""
-            vals[6] = round(vals[4] * price1, 2)
-            vals[10] = round(vals[8] * price2, 2)
+            vals[6] = round(qty1 * price1, 2)
+            vals[10] = round(qty2 * price2, 2)
             node_mat_cost1 += vals[6]
             node_mat_cost2 += vals[10]
             out.append(tuple(vals))
@@ -380,18 +397,21 @@ def parse_exported_sheet(sheet_values):
     """Разбирает ранее экспортированный лист 'Смета' из Excel.
     
     Извлекает название сметы, последовательность работ, а также значения
-    дополнительных расходов: накладные, подъёмные механизмы, вывоз мусора.
+    дополнительных расходов: накладные, подъёмные механизмы, вывоз мусора,
+    бетононасос.
     
     Args:
         sheet_values: двумерный список значений ячеек листа Excel.
         
     Returns:
         dict: словарь с ключами:
-            - title (str): название сметы
-            - overhead (tuple): (В1, В2) накладные расходы
-            - lifting (tuple): (В1, В2) подъёмные механизмы
-            - lifting_trash (tuple): (В1, В2) вывоз мусора
-            - sequence (list): список кортежей ('section', name) или ('work', name, vol)
+            - title (str): название сметы.
+            - overhead (tuple): (В1, В2) накладные расходы.
+            - lifting (tuple): (В1, В2) подъёмные механизмы.
+            - lifting_trash (tuple): (В1, В2) вывоз мусора.
+            - betonopump (tuple): (В1, В2) бетононасос.
+            - sequence (list): список кортежей ('section', name) или 
+                ('work', name, vol).
     """
     import math
     
@@ -399,6 +419,7 @@ def parse_exported_sheet(sheet_values):
     overhead = (0.0, 0.0)
     lifting = (0.0, 0.0)
     lifting_trash = (0.0, 0.0)
+    betonopump = (0.0, 0.0)
     sequence = []
 
     if sheet_values:
@@ -484,6 +505,15 @@ def parse_exported_sheet(sheet_values):
                 pass
             continue
 
+        if "бетононасос" in name.lower():
+            try:
+                val1 = float(row[6]) if len(row) > 6 and not (isinstance(row[6], float) and math.isnan(row[6])) else 0.0
+                val2 = float(row[10]) if len(row) > 10 and not (isinstance(row[10], float) and math.isnan(row[10])) else 0.0
+                betonopump = (val1, val2)
+            except (ValueError, TypeError, IndexError):
+                pass
+            continue
+
         is_numbered = False
         if str0 and str0.replace('.', '').isdigit():
             is_numbered = True
@@ -500,6 +530,7 @@ def parse_exported_sheet(sheet_values):
         'overhead': overhead,
         'lifting': lifting,
         'lifting_trash': lifting_trash,
+        'betonopump': betonopump,
         'sequence': sequence,
     }
 
@@ -508,7 +539,7 @@ def parse_exported_sheet(sheet_values):
 # --------------------------------------------------------------------------
 def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
                           overhead1=0.0, overhead2=0.0, lift1=0.0, lift2=0.0,
-                          trash1=0.0, trash2=0.0):
+                          trash1=0.0, trash2=0.0, betonopump1=0.0, betonopump2=0.0):
     """Выгружает смету в Excel-файл с формулами и форматированием.
     
     Создаёт XLSX-файл с листом 'Смета', содержащим структурированные данные
@@ -519,7 +550,8 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         - Заголовок сметы
         - Шапка с колонками для двух вариантов цен
         - Блоки работ: строка работы → в т.ч. работы/материалы → список материалов
-        - Итоги: работы, материалы, накладные, подъёмные механизмы, вывоз мусора
+        - Итоги: работы, материалы, накладные, подъёмные механизмы, 
+          вывоз мусора, бетононасос
         - Общая сумма с расчётом экономии и соотношения В1/В2
     
     Args:
@@ -527,12 +559,15 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         output_path (str): путь к создаваемому XLSX-файлу.
         title (str): название сметы. По умолчанию "Смета".
         meta_rows (list, optional): список метаданных для листа Meta.
+            Каждая строка — список из 10 значений в формате COLS.
         overhead1 (float): накладные расходы вариант 1.
         overhead2 (float): накладные расходы вариант 2.
         lift1 (float): подъёмные механизмы вариант 1.
         lift2 (float): подъёмные механизмы вариант 2.
         trash1 (float): вывоз мусора вариант 1.
         trash2 (float): вывоз мусора вариант 2.
+        betonopump1 (float): бетононасос вариант 1.
+        betonopump2 (float): бетононасос вариант 2.
         
     Returns:
         str: полный путь к созданному файлу.
@@ -678,16 +713,23 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
                 unit_m = str(mvals[2])
                 norm1 = to_float(mvals[3])
                 norm2 = to_float(mvals[7])
+                round_up = bool(len(mvals) > 11 and mvals[11])
 
                 ws.write_blank(r, 0, None, f_blank)
                 ws.write(r, 1, mat_name, f_mat_txt)
                 ws.write(r, 2, unit_m, f_mat_txt)
                 ws.write(r, 3, norm1, f_mat_num)
-                ws.write_formula(r, 4, f"={RC(r, 3)}*{RC(row_top, 4)}", f_mat_num)
+                if round_up:
+                    ws.write_formula(r, 4, f"=ROUNDUP({RC(r, 3)}*{RC(row_top, 4)},0)", f_mat_num)
+                else:
+                    ws.write_formula(r, 4, f"={RC(r, 3)}*{RC(row_top, 4)}", f_mat_num)
                 price_cell(seen_mat1, mat_name, r, 5, to_float(mvals[5]), f_mat_num)
                 ws.write_formula(r, 6, f"={RC(r, 4)}*{RC(r, 5)}", f_mat_num)
                 ws.write(r, 7, norm2, f_mat_num)
-                ws.write_formula(r, 8, f"={RC(r, 7)}*{RC(row_top, 8)}", f_mat_num)
+                if round_up:
+                    ws.write_formula(r, 8, f"=ROUNDUP({RC(r, 7)}*{RC(row_top, 8)},0)", f_mat_num)
+                else:
+                    ws.write_formula(r, 8, f"={RC(r, 7)}*{RC(row_top, 8)}", f_mat_num)
                 price_cell(seen_mat2, mat_name, r, 9, to_float(mvals[9]), f_mat_num)
                 ws.write_formula(r, 10, f"={RC(r, 8)}*{RC(r, 9)}", f_mat_num)
 
@@ -713,6 +755,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     row_overhead = row_total + 3
     row_lifting = row_total + 4
     row_trash = row_total + 5
+    row_betonopump = row_total + 6
 
     works_f1 = "+".join(workonly_total1_refs) if workonly_total1_refs else "0"
     works_f2 = "+".join(workonly_total2_refs) if workonly_total2_refs else "0"
@@ -744,9 +787,14 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
     ws.write(row_trash, 10, trash2, f_sub_num)
     ws.write_formula(row_trash, 9, f"=IF({RC(row_trash,6)}=0,0,{RC(row_trash,10)}/{RC(row_trash,6)})", f_ratio)
 
+    ws.write(row_betonopump, 1, "Бетононасос", f_sub_lbl)
+    ws.write(row_betonopump, 6, betonopump1, f_sub_num)
+    ws.write(row_betonopump, 10, betonopump2, f_sub_num)
+    ws.write_formula(row_betonopump, 9, f"=IF({RC(row_betonopump,6)}=0,0,{RC(row_betonopump,10)}/{RC(row_betonopump,6)})", f_ratio)
+
     ws.write(row_total, 1, "ИТОГО:", f_total_lbl)
-    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}+{RC(row_trash,6)}"
-    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}+{RC(row_trash,10)}"
+    total_f1 = f"={RC(row_works,6)}+{RC(row_mats,6)}+{RC(row_overhead,6)}+{RC(row_lifting,6)}+{RC(row_trash,6)}+{RC(row_betonopump,6)}"
+    total_f2 = f"={RC(row_works,10)}+{RC(row_mats,10)}+{RC(row_overhead,10)}+{RC(row_lifting,10)}+{RC(row_trash,10)}+{RC(row_betonopump,10)}"
     ws.write_formula(row_total, 6, total_f1, f_total_num)
     ws.write_formula(row_total, 10, total_f2, f_total_num)
     ws.write_formula(row_total, 8, f"={RC(row_total,6)}-{RC(row_total,10)}", f_total_num)
