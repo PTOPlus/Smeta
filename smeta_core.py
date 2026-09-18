@@ -430,7 +430,27 @@ def parse_exported_sheet(sheet_values):
                         title = str(cell).strip()
                         break
 
-    for row_idx, row in enumerate(sheet_values): 
+    def _safe_str(val):
+        if val is None:
+            return ""
+        if isinstance(val, float) and math.isnan(val):
+            return ""
+        return str(val).strip()
+
+    # Ищем шапку таблицы ("№ п/п") — парсим только строки после неё.
+    # Строки до шапки (название сметы, заголовки вариантов) не должны
+    # попадать в sequence как разделы или работы.
+    header_idx = None
+    for i, row in enumerate(sheet_values):
+        if row and "№ п/п" in _safe_str(row[0]):
+            header_idx = i
+            break
+    if header_idx is not None:
+        parse_rows = sheet_values[header_idx + 1:]
+    else:
+        parse_rows = sheet_values  # старый формат без явной шапки — парсим всё
+
+    for row_idx, row in enumerate(parse_rows): 
         if not row:
             continue
 
@@ -447,7 +467,7 @@ def parse_exported_sheet(sheet_values):
         str0 = safe_str(col0)
         str1 = safe_str(col1)
         
-        if "№ п/п" in str0 or "№" in str0:
+        if "№ п/п" in str0:
             continue
         if "Наименование" in str1 and "Ед. изм" in str(row[2] if len(row) > 2 else ""):
             continue
