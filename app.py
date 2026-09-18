@@ -1996,6 +1996,415 @@ class SmetaMainWindow(QMainWindow):
         self.statusBar().showMessage(f"Удалено строк: {len(to_delete)}")
 
     # =======================================================================
+    # Черновик
+    # =======================================================================
+    def _save_draft(self):
+        draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        try:
+            prev_state = {}
+            if os.path.exists(draft_path):
+                with open(draft_path, 'r', encoding='utf-8') as f:
+                    prev_state = json.load(f)
+
+            current_state = {
+                'rows': [list(r) for r in self.smeta_rows],
+                'title': self.smeta_title,
+                'sections': list(self.sections),
+                'extra': (self.extra_overhead1, self.extra_overhead2,
+                          self.extra_lifting1, self.extra_lifting2,
+                          self.extra_trash1, self.extra_trash2,
+                          self.extra_betonopump1, self.extra_betonopump2),
+            }
+            draft = {
+                'prev_state': prev_state,
+                'current_state': current_state,
+                'timestamp': datetime.now().isoformat(),
+            }
+            with open(draft_path, 'w', encoding='utf-8') as f:
+                json.dump(draft, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка сохранения черновика: {e}")
+
+    def _load_draft(self):
+        draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        if not os.path.exists(draft_path):
+            return
+        try:
+            with open(draft_path, 'r', encoding='utf-8') as f:
+                draft = json.load(f)
+            current = draft.get('current_state')
+            if current is None:
+                return
+            self._restore_state(current)
+            self.statusBar().showMessage("Черновик восстановлен")
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка загрузки черновика: {e}")
+
+    # =======================================================================
+    # Экспорт / Импорт
+    # =======================================================================
+    def _export_to_excel(self):
+        """Открывает диалог сохранения сметы в Excel."""
+        if not self._do_export_to_excel():
+            return
+        self.statusBar().showMessage("Экспорт завершён")
+        QMessageBox.information(self, "Экспорт", "Смета экспортирована успешно.")
+
+    def _import_from_excel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл Excel", self.export_folder, "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, data_only=True)
+            if "Смета" not in wb.sheetnames:
+                QMessageBox.warning(self, "Ошибка", "Нет листа 'Смета'.")
+                return
+            ws = wb["Смета"]
+            values = [list(row) for row in ws.iter_rows(values_only=True)]
+            parsed = parse_exported_sheet(values)
+            seq = parsed['sequence']
+            if not seq:
+                QMessageBox.warning(self, "Ошибка", "Не удалось распознать строки сметы.")
+                return
+
+            self.smeta_rows = []
+            self.sections = []
+            self.smeta_title = parsed['title'] if parsed['title'] else "Смета"
+            self.title_edit.setText(self.smeta_title)
+
+            self.extra_overhead1 = self.extra_overhead2 = 0.0
+            self.extra_lifting1 = self.extra_lifting2 = 0.0
+            self.extra_trash1 = self.extra_trash2 = 0.0
+            self.extra_betonopump1 = self.extra_betonopump2 = 0.0
+            self.extra_overhead1, self.extra_overhead2 = parsed['overhead']
+            self.extra_lifting1, self.extra_lifting2 = parsed['lifting']
+            self.extra_trash1, self.extra_trash2 = parsed['lifting_trash']
+            if 'betonopump' in parsed:
+                self.extra_betonopump1, self.extra_betonopump2 = parsed['betonopump']
+            self._update_extra_table()
+
+            for item in seq:
+                if item[0] == 'section':
+                    self.sections.append(item[1])
+                elif item[0] == 'work':
+                    block = build_work_block(item[1], item[2], None, len(self.smeta_rows) + 1, self.db_mgr)
+                    if block:
+                        self.smeta_rows.extend(block)
+
+            self.smeta_rows = rebuild_smeta(self.smeta_rows)
+            self._update_table_from_rows()
+            self._save_draft()
+
+            self._refresh_works_table()
+            self._refresh_materials_table()
+            self._refresh_works_combo()
+            self._refresh_link_works_combo()
+
+            self.statusBar().showMessage(f"Импорт: {path}")
+            QMessageBox.information(self, "Импорт", f"Смета импортирована:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка импорта", str(e))
+
+    # =======================================================================
+    # Закрытие
+    # =======================================================================
+    def closeEvent(self, event):
+        self._save_draft()
+        self._save_column_widths()
+        self._save_window_geometry()
+        self._save_settings()
+        if self.db_mgr:
+            self.db_mgr.flush()
+            self.db_mgr.close()
+        event.accept()
+
+    # =======================================================================
+    # Слоты
+    # =======================================================================
+    def _on_title_changed(self, text):
+        self.smeta_title = text.strip() if text else "Смета"
+
+    # =======================================================================
+    # Доп. расходы — таблица
+    # =======================================================================
+    def _update_extra_table(self):
+        """Заполняет таблицу дополнительных расходов значениями из переменных экземпляра.
+        
+        Синхронизирует отображение таблицы extra_table с текущими значениями
+        всех статей доп. расходов (накладные, подъёмные, вывоз мусора, бетононасос).
+        Вызывается при загрузке черновика, импорте из Excel и восстановлении состояния.
+        """
+        self.extra_table.item(0, 1).setText(f"{self.extra_overhead1:.2f}")
+        self.extra_table.item(0, 2).setText(f"{self.extra_overhead2:.2f}")
+        self.extra_table.item(1, 1).setText(f"{self.extra_lifting1:.2f}")
+        self.extra_table.item(1, 2).setText(f"{self.extra_lifting2:.2f}")
+        self.extra_table.item(2, 1).setText(f"{self.extra_trash1:.2f}")
+        self.extra_table.item(2, 2).setText(f"{self.extra_trash2:.2f}")
+        self.extra_table.item(3, 1).setText(f"{self.extra_betonopump1:.2f}")
+        self.extra_table.item(3, 2).setText(f"{self.extra_betonopump2:.2f}")
+
+    def _on_extra_table_changed(self, row, col):
+        """Слот, вызываемый при изменении ячейки таблицы дополнительных расходов.
+        
+        Считывает все значения из таблицы extra_table в соответствующие переменные
+        экземпляра, затем сохраняет черновик и пересчитывает итоговые суммы.
+        
+        Args:
+            row (int): индекс изменённой строки (не используется, читаются все строки).
+            col (int): индекс изменённой колонки (не используется, читаются все колонки).
+        """
+        self.extra_overhead1 = to_float(self.extra_table.item(0, 1).text())
+        self.extra_overhead2 = to_float(self.extra_table.item(0, 2).text())
+        self.extra_lifting1 = to_float(self.extra_table.item(1, 1).text())
+        self.extra_lifting2 = to_float(self.extra_table.item(1, 2).text())
+        self.extra_trash1 = to_float(self.extra_table.item(2, 1).text())
+        self.extra_trash2 = to_float(self.extra_table.item(2, 2).text())
+        self.extra_betonopump1 = to_float(self.extra_table.item(3, 1).text())
+        self.extra_betonopump2 = to_float(self.extra_table.item(3, 2).text())
+        self._save_draft()
+        self._update_totals()
+
+    def _on_extra_cell_double_click(self, row, col):
+        """Обрабатывает двойной клик по ячейке таблицы дополнительных расходов.
+        
+        Создаёт временный QDoubleSpinBox, позиционированный поверх ячейки,
+        для удобного редактирования числовых значений. При завершении редактирования
+        сохраняет значение в ячейку и эмулирует сигнал cellChanged.
+        
+        Args:
+            row (int): строка ячейки.
+            col (int): колонка ячейки (0 — текстовое поле, игнорируется).
+        """
+        if col == 0:
+            return  # текстовое поле — не редактируем
+        current_text = self.extra_table.item(row, col).text()
+        current_val = to_float(current_text)
+
+        spin = QDoubleSpinBox(self)
+        spin.setRange(0, 99999999)
+        spin.setDecimals(2)
+        spin.setValue(current_val)
+        spin.setFixedWidth(140)
+        spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Позиционируем spin над ячейкой
+        rect = self.extra_table.cellRect(row, col)
+        header_h = self.extra_table.horizontalHeader().height()
+        viewport = self.extra_table.viewport()
+        pos = self.extra_table.mapToGlobal(viewport.pos() + rect.topLeft())
+
+        spin.move(pos.x(), pos.y() + header_h - 2)
+        spin.show()
+        spin.raise_()
+
+        def on_spin_finished():
+            """Завершает редактирование: записывает значение и удаляет spinbox."""
+            val = spin.value()
+            self.extra_table.item(row, col).setText(f"{val:.2f}")
+            self.extra_table.cellChanged.emit(row, col)
+            spin.deleteLater()
+
+        spin.editingFinished.connect(on_spin_finished)
+
+    # =======================================================================
+    # Сохранение / Загрузка ширин колонок и геометрии окна
+    # =======================================================================
+    def _save_column_widths(self):
+        """Сохраняет ширины колонок всех таблиц в JSON-файл.
+        
+        Собирает текущие ширины колонок пяти таблиц (smeta_table, works_table,
+        materials_table, links_table, extra_table) и записывает их в файл
+        column_widths.json в папке базы данных. Вызывается при изменении ширины
+        любой колонки (сигнал sectionResized) и при закрытии окна.
+        """
+        try:
+            widths = {
+                "smeta_table": [self.smeta_table.columnWidth(c) for c in range(self.smeta_table.columnCount())],
+                "works_table": [self.works_table.columnWidth(c) for c in range(self.works_table.columnCount())],
+                "materials_table": [self.materials_table.columnWidth(c) for c in range(self.materials_table.columnCount())],
+                "links_table": [self.links_table.columnWidth(c) for c in range(self.links_table.columnCount())],
+                "extra_table": [self.extra_table.columnWidth(c) for c in range(self.extra_table.columnCount())],
+            }
+            path = os.path.join(self.db_folder, COLUMN_WIDTHS_FILE)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(widths, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _load_column_widths(self):
+        """Загружает ширины колонок всех таблиц из JSON-файла.
+        
+        Читает файл column_widths.json из папки базы данных и применяет
+        сохранённые ширины ко всем пяти таблицам. Если файл отсутствует
+        или повреждён, метод завершается без ошибок. Вызывается при
+        инициализации главного окна.
+        """
+        try:
+            path = os.path.join(self.db_folder, COLUMN_WIDTHS_FILE)
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                widths = json.load(f)
+
+            self._apply_widths(self.smeta_table, widths.get("smeta_table"))
+            self._apply_widths(self.works_table, widths.get("works_table"))
+            self._apply_widths(self.materials_table, widths.get("materials_table"))
+            self._apply_widths(self.links_table, widths.get("links_table"))
+            self._apply_widths(self.extra_table, widths.get("extra_table"))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _apply_widths(table, widths):
+        """Применяет список ширин к таблице, если количество колонок совпадает.
+        
+        Args:
+            table (QTableWidget): таблица, к которой применяются ширины.
+            widths (list[int] | None): список ширин колонок в пикселях.
+                Если None или длина не совпадает с количеством колонок таблицы,
+                метод завершается без изменений.
+        """
+        if widths is None or len(widths) != table.columnCount():
+            return
+        for col, w in enumerate(widths):
+            try:
+                table.setColumnWidth(col, int(w))
+            except (ValueError, OverflowError):
+                pass
+
+    def _save_window_geometry(self):
+        """Сохраняет размер и позицию главного окна в JSON-файл.
+        
+        Использует QMainWindow.saveGeometry() для сериализации состояния окна
+        (размер, позиция, состояние развёрнутости) и записывает его в hex-строку
+        в файл window_geometry.json в папке базы данных. Вызывается при закрытии
+        окна (closeEvent).
+        """
+        try:
+            geo = self.saveGeometry()
+            path = os.path.join(self.db_folder, "window_geometry.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(geo.data().hex(), f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _load_window_geometry(self):
+        """Загружает размер и позицию главного окна из JSON-файла.
+        
+        Читает hex-строку из файла window_geometry.json и восстанавливает
+        состояние окна через QMainWindow.restoreGeometry(). Если файл
+        отсутствует или повреждён, окно открывается с размером по умолчанию.
+        Вызывается при инициализации главного окна.
+        """
+        try:
+            path = os.path.join(self.db_folder, "window_geometry.json")
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                hex_str = f.read().strip()
+            if not hex_str:
+                return
+            geo_data = bytes.fromhex(hex_str)
+            self.restoreGeometry(geo_data)
+        except Exception:
+            pass
+
+    # =======================================================================
+    # Сохранение / Загрузка настроек
+    # =======================================================================
+    def _load_settings(self):
+        """Загружает настройки приложения из JSON-файла в рабочей папке.
+        
+        Читает файл settings.json и восстанавливает пути к папкам базы данных
+        и экспорта, а также коэффициент цены В1 от В2.
+        Вызывается при инициализации главного окна до создания БД.
+        """
+        try:
+            path = os.path.join(os.getcwd(), SETTINGS_FILE)
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            if "db_folder" in settings:
+                self.db_folder = settings["db_folder"]
+            if "export_folder" in settings:
+                self.export_folder = settings["export_folder"]
+            if "koeff_price" in settings:
+                self.koeff_price = settings["koeff_price"]
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        """Сохраняет настройки приложения в JSON-файл в рабочей папке.
+        
+        Записывает текущие значения db_folder, export_folder и koeff_price
+        в файл settings.json. Вызывается после сохранения настроек в диалоге
+        и при закрытии окна.
+        """
+        try:
+            settings = {
+                "db_folder": self.db_folder,
+                "export_folder": self.export_folder,
+                "koeff_price": self.koeff_price,
+            }
+            path = os.path.join(os.getcwd(), SETTINGS_FILE)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # =======================================================================
+    # Справка / Настройки
+    # =======================================================================
+    def _show_about(self):
+        QMessageBox.about(
+            self, "О программе — Сметчик PRO 5.3",
+            "Сметчик PRO 5.3\n\n"
+            "Приложение для составления смет с поддержкой двух вариантов цены.\n\n"
+            "Автор: Крезуб Павел (@pto_plus) | Лицензия: MIT\n\n"
+            "Технологии: Python 3, PyQt6, SQLite, pandas, openpyxl, xlsxwriter\n\n"
+            "Функционал:\n"
+            "• Справочник работ и материалов с ценами В1 и В2\n"
+            "• Автоматический расчёт материалов по нормам расхода\n"
+            "• Сравнение вариантов стоимости и расчёт экономии\n"
+            "• Экспорт в Excel с формулами и форматированием\n"
+            "• Импорт смет из Excel с восстановлением структуры\n"
+            "• Черновик сметы с автосохранением\n"
+            "• Управление разделами сметы\n"
+            "• Дополнительные расходы: накладные, подъёмные механизмы, вывоз мусора\n"
+            "• Создание и переключение между базами данных\n\n"
+            "Горячие клавиши:\n"
+            "Ctrl+S — Сохранить черновик\n"
+            "Ctrl+E — Экспорт в Excel\n"
+            "Ctrl+I — Импорт из Excel\n"
+            "Ctrl+Z — Отменить действие\n"
+            "Ctrl+Y — Повторить действие\n"
+            "Ctrl+W — Добавить работу\n"
+            "Ctrl+D — Добавить раздел\n"
+            "Ctrl+Q — Выход\n\n"
+            "Документация: https://gitflic.ru/project/pto_plus/smeta/blob/raw?file=README.md\n"
+            "Обратная связь: vremyanca@list.ru",
+        )
+
+    def show_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.folder_edit.setText(self.db_folder)
+        dlg.export_edit.setText(self.export_folder)
+        dlg.koeff_spin.setValue(self.koeff_price)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            folder, export, koeff = dlg.get_values()
+            if folder:
+                self.db_folder = folder
+            if export:
+                self.export_folder = export
+            self.koeff_price = koeff
+            self._save_settings()
+            self.statusBar().showMessage("Настройки сохранены")
+
+    # =======================================================================
     # Undo / Redo
     # =======================================================================
     def _push_undo_state(self):
@@ -2090,6 +2499,9 @@ class SmetaMainWindow(QMainWindow):
         Пользователю предлагаются три варианта: пустая смета, смета из базы
         данных или отмена (при отмене или закрытии диалога ничего не меняется).
         """
+        pass
+    def _show_exit_dialog(self):
+        """Показывает диалог выхода с выбором действия."""
         msg = QMessageBox(self)
         msg.setWindowTitle("Выход")
         msg.setText("Выберите действие:")
