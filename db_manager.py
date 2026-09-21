@@ -12,7 +12,7 @@ from typing import Optional, Dict
 # Нормализованная структура БД (колонки для DataFrame-представления)
 WORKS_COLS = ['id', 'name', 'unit', 'price_1', 'price_2']
 MATERIALS_COLS = ['id', 'name', 'unit', 'price_1', 'price_2']
-WORK_MATERIALS_COLS = ['work_id', 'material_id', 'consumption_1', 'consumption_2']
+WORK_MATERIALS_COLS = ['work_id', 'material_id', 'consumption_1', 'consumption_2', 'round_up']
 
 # Старый формат (для миграции и совместимости)
 LEGACY_COLS = ['Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм',
@@ -128,6 +128,7 @@ class DatabaseManager:
                 material_id INTEGER NOT NULL,
                 consumption_1 REAL DEFAULT 0.0,
                 consumption_2 REAL DEFAULT 0.0,
+                round_up INTEGER DEFAULT 0,
                 PRIMARY KEY (work_id, material_id),
                 FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
                 FOREIGN KEY (material_id) REFERENCES materials(id) ON DELETE CASCADE
@@ -142,10 +143,20 @@ class DatabaseManager:
         """
         self._create_tables()
 
+        # Миграция: добавляем колонку round_up, если её нет (для старых БД)
+        try:
+            self.conn.execute("ALTER TABLE work_materials ADD COLUMN round_up INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Колонка уже существует
+
         # Читаем таблицы
         self.works_cache = pd.read_sql_query("SELECT * FROM works", self.conn)
         self.materials_cache = pd.read_sql_query("SELECT * FROM materials", self.conn)
         self.work_materials_cache = pd.read_sql_query("SELECT * FROM work_materials", self.conn)
+
+        # Убедимся, что колонка round_up присутствует (для старых БД после ALTER)
+        if 'round_up' not in self.work_materials_cache.columns:
+            self.work_materials_cache['round_up'] = 0
 
         # Убедимся, что типы данных корректны
         for col in ['price_1', 'price_2', 'consumption_1', 'consumption_2']:
@@ -232,6 +243,7 @@ class DatabaseManager:
                     'material_id': mat_id_map[mat_name],
                     'consumption_1': float(row.get('Расход_1', 0)) if pd.notna(row.get('Расход_1')) else 0.0,
                     'consumption_2': float(row.get('Расход_2', 0)) if pd.notna(row.get('Расход_2')) else 0.0,
+                    'round_up': 0,
                 })
 
         # Создаём DataFrame из собранных данных
@@ -486,12 +498,13 @@ class DatabaseManager:
             materials.append({
                 'name': mat['name'], 'unit': mat['unit'],
                 'price_1': mat['price_1'], 'price_2': mat['price_2'],
-                'consumption_1': link['consumption_1'], 'consumption_2': link['consumption_2']
+                'consumption_1': link['consumption_1'], 'consumption_2': link['consumption_2'],
+                'round_up': bool(link.get('round_up', 0))
             })
 
         return {'work': work, 'materials': materials}
 
-    def add_work_material_link(self, work_id: int, material_id: int, consumption_1: float, consumption_2: float):
+    def add_work_material_link(self, work_id: int, material_id: int, consumption_1: float, consumption_2: float, round_up: bool = False):
         """Добавляет или обновляет связь между работой и материалом.
         
         Если связь уже существует — обновляет нормы расхода. Иначе создаёт новую.
@@ -501,16 +514,19 @@ class DatabaseManager:
             material_id (int): id материала.
             consumption_1 (float): норма расхода варианта 1.
             consumption_2 (float): норма расхода варианта 2.
+            round_up (bool): округлять объём вверх до целого.
         """
         mask = (self.work_materials_cache['work_id'] == work_id) & (self.work_materials_cache['material_id'] == material_id)
 
         if mask.any():
             self.work_materials_cache.loc[mask, 'consumption_1'] = consumption_1
             self.work_materials_cache.loc[mask, 'consumption_2'] = consumption_2
+            self.work_materials_cache.loc[mask, 'round_up'] = int(round_up)
         else:
             new_row = pd.DataFrame([{
                 'work_id': work_id, 'material_id': material_id,
-                'consumption_1': consumption_1, 'consumption_2': consumption_2
+                'consumption_1': consumption_1, 'consumption_2': consumption_2,
+                'round_up': int(round_up)
             }])
             self.work_materials_cache = pd.concat([self.work_materials_cache, new_row], ignore_index=True)
 
