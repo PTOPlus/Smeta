@@ -373,6 +373,65 @@ def rebuild_smeta(rows):
     flush_node()
     return out
 
+def resync_smeta_with_db(rows, db=None, db_manager=None):
+    """Пересобирает смету по актуальным данным справочника (в т.ч. по связям).
+
+    В отличие от rebuild_smeta, которая пересчитывает только производные
+    величины (объёмы, стоимости, итоги) из значений, уже хранящихся в строках
+    сметы, эта функция заново берёт из справочника сами исходные данные:
+    цены и единицу измерения работы, состав материалов работы, нормы расхода
+    и флаг округления. Поэтому добавленные, удалённые и изменённые в
+    справочнике связи попадают в смету.
+
+    Порядок обхода: каждая строка работы вместе со следующими за ней
+    строками материалов считается одним блоком. Блок заменяется результатом
+    build_work_block с сохранением объёма работы. Если работа в справочнике
+    не найдена (например, строка загружена из Excel), блок остаётся как есть.
+    Разделы и прочие строки (дополнительные расходы) не изменяются.
+
+    Args:
+        rows (list): список кортежей строк сметы.
+        db (pd.DataFrame, optional): legacy-справочник в формате COLS.
+        db_manager (DatabaseManager, optional): менеджер SQLite-базы.
+
+    Returns:
+        list: список строк сметы, синхронизированный со справочником и
+            пересчитанный через rebuild_smeta (нумерация и итоги обновлены).
+    """
+    cleaned = [r for r in rows if not is_total(str(r[1]))]
+    out = []
+    i = 0
+    total = len(cleaned)
+
+    while i < total:
+        raw = cleaned[i]
+        name = str(raw[1]).strip()
+
+        if not is_work(name):
+            out.append(tuple(raw))
+            i += 1
+            continue
+
+        # Собираем строки материалов, принадлежащие этой работе.
+        j = i + 1
+        while j < total and is_material(str(cleaned[j][1]).strip()):
+            j += 1
+
+        work_name = clean_name(name)
+        vol = to_float(raw[4], 0.0)
+        if vol <= 0:
+            vol = 1.0
+
+        block = build_work_block(work_name, vol, db, 1, db_manager)
+        if block is None:
+            # Работы нет в справочнике — оставляем строки без изменений.
+            out.extend(tuple(r) for r in cleaned[i:j])
+        else:
+            out.extend(block)
+        i = j
+
+    return rebuild_smeta(out)
+
 def compute_grand_totals(rows):
     """Вычисляет общие итоги сметы — сумму всех строк 'ИТОГО ПО УЗЛУ'.
     

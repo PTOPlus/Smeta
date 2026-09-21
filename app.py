@@ -20,7 +20,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut, QColor
 
 from smeta_core import (
-    build_work_block, rebuild_smeta, compute_grand_totals,
+    build_work_block, rebuild_smeta, resync_smeta_with_db, compute_grand_totals,
     export_smeta_to_excel, parse_exported_sheet,
     to_float, is_section, is_work, is_total, is_material, clean_name,
     SECTION_PREFIX, WORK_PREFIX, TOTAL_PREFIX,
@@ -1616,16 +1616,29 @@ class SmetaMainWindow(QMainWindow):
         self._update_table_from_rows()
 
     def _recalc_smeta(self):
-        """Полностью пересчитывает смету и обновляет таблицу и черновик.
+        """Полностью пересчитывает смету по актуальным данным справочника.
+
+        В отличие от простого пересчёта производных величин, смета заново
+        собирается по справочнику: берутся текущие цены и единицы измерения
+        работ, состав материалов, нормы расхода и флаги округления. Поэтому
+        изменения связей (добавление/удаление материала у работы, правка
+        нормы) применяются к уже составленной смете. Работы, отсутствующие в
+        справочнике, остаются без изменений.
 
         Перед пересчётом текущее состояние сохраняется в undo-стек, поэтому
-        пересчёт можно отменить.
+        пересчёт можно отменить (Ctrl+Z).
         """
         self._push_undo_state()
-        self.smeta_rows = rebuild_smeta(self.smeta_rows)
+        if self.db_mgr is not None:
+            try:
+                self.db_mgr.flush()
+            except Exception as e:
+                self.statusBar().showMessage(f"Не удалось сохранить базу: {e}")
+        self.smeta_rows = resync_smeta_with_db(self.smeta_rows, None, self.db_mgr)
         self._update_table_from_rows()
         self._save_draft()
-        self.statusBar().showMessage("Смета пересчитана")
+        self.statusBar().showMessage("Смета пересчитана по справочнику")
+
 
     def _clear_smeta(self):
         """Очищает смету полностью после подтверждения пользователем.
@@ -2582,13 +2595,6 @@ class SmetaMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка экспорта", str(e))
             return False
-
-    def _export_to_excel(self):
-        """Открывает диалог сохранения сметы в Excel."""
-        if not self._do_export_to_excel():
-            return
-        self.statusBar().showMessage("Экспорт завершён")
-        QMessageBox.information(self, "Экспорт", "Смета экспортирована успешно.")
 
 
 # ---------------------------------------------------------------------------
