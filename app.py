@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Главный модуль приложения «Сметчик PRO 5.3» (PyQt6).
+app.py — Главный модуль приложения «Сметчик PRO 5.3.1» (PyQt6).
 Графический интерфейс: два таба — «Составление сметы» и «Справочник».
 Управление базами, черновик, настройки, экспорт/импорт.
 """
@@ -22,7 +22,7 @@ from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut, QColor
 from smeta_core import (
     build_work_block, rebuild_smeta, resync_smeta_with_db, compute_grand_totals,
     export_smeta_to_excel, parse_exported_sheet,
-    to_float, is_section, is_work, is_total, is_material, clean_name,
+    to_float, apply_price_koeff, is_section, is_work, is_total, is_material, clean_name,
     SECTION_PREFIX, WORK_PREFIX, TOTAL_PREFIX,
     CALC_HEADERS, COLS,
 )
@@ -344,7 +344,7 @@ class SectionDialog(QDialog):
 # Главное окно
 # ---------------------------------------------------------------------------
 class SmetaMainWindow(QMainWindow):
-    """Главное окно приложения «Сметчик PRO 5.3».
+    """Главное окно приложения «Сметчик PRO 5.3.1».
 
     Содержит две вкладки — «Составление сметы» и «Справочник», — а также
     работу с базами данных, черновиком, настройками и экспортом/импортом Excel.
@@ -359,7 +359,7 @@ class SmetaMainWindow(QMainWindow):
         ширины колонок и геометрия окна.
         """
         super().__init__()
-        self.setWindowTitle("Сметчик PRO 5.3")
+        self.setWindowTitle("Сметчик PRO 5.3.1")
         self.resize(*WINDOW_SIZE)
 
         # --- Состояние ---
@@ -1054,7 +1054,12 @@ class SmetaMainWindow(QMainWindow):
         self.ref_work_price2.setValue(float(rd['price_2']))
 
     def _on_work_item_changed(self, item):
-        """Сохраняет изменения ячейки таблицы работ в БД."""
+        """Сохраняет изменения ячейки таблицы работ в БД.
+
+        При правке цены В2, если цена В1 пустая или равна нулю, цена В1
+        автоматически подставляется как В2 * koeff_price (коэффициент из
+        настроек) и обновляется в таблице.
+        """
         row = item.row()
         col = item.column()
         if col == 0:
@@ -1072,15 +1077,23 @@ class SmetaMainWindow(QMainWindow):
             elif col == 2:
                 self.db_mgr.update_work(wid, unit=val)
             elif col == 3:
-                self.db_mgr.update_work(wid, price_1=to_float(val))
+                price2 = to_float(self.works_table.item(row, 4).text())
+                price1 = apply_price_koeff(to_float(val), price2, self.koeff_price)
+                self.db_mgr.update_work(wid, price_1=price1)
                 # Форматируем отображение
                 self.works_table.blockSignals(True)
-                self.works_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.works_table.item(row, col).setText(f"{price1:.2f}")
                 self.works_table.blockSignals(False)
             elif col == 4:
-                self.db_mgr.update_work(wid, price_2=to_float(val))
+                price2 = to_float(val)
+                price1 = to_float(self.works_table.item(row, 3).text())
+                new_price1 = apply_price_koeff(price1, price2, self.koeff_price)
+                self.db_mgr.update_work(wid, price_2=price2)
                 self.works_table.blockSignals(True)
-                self.works_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.works_table.item(row, col).setText(f"{price2:.2f}")
+                if new_price1 != price1:
+                    self.db_mgr.update_work(wid, price_1=new_price1)
+                    self.works_table.item(row, 3).setText(f"{new_price1:.2f}")
                 self.works_table.blockSignals(False)
             self.db_mgr.flush()
             self._refresh_works_combo()
@@ -1091,6 +1104,8 @@ class SmetaMainWindow(QMainWindow):
     def _add_work(self):
         """Добавляет работу из формы в базу и обновляет таблицы и списки.
 
+        Если цена В1 пустая или равна нулю, а цена В2 задана, цена В1
+        подставляется как В2 * koeff_price (коэффициент из настроек).
         Пустое название работы отклоняется с предупреждением.
         """
         name = self.ref_work_name.text().strip()
@@ -1100,6 +1115,7 @@ class SmetaMainWindow(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Ошибка", "Введите название работы.")
             return
+        p1 = apply_price_koeff(p1, p2, self.koeff_price)
         self.db_mgr.add_work(name, unit, p1, p2)
         self._refresh_works_table()
         self._refresh_works_combo()
@@ -1110,6 +1126,8 @@ class SmetaMainWindow(QMainWindow):
     def _update_work(self):
         """Обновляет выбранную в таблице работу значениями из формы.
 
+        Если цена В1 пустая или равна нулю, а цена В2 задана, цена В1
+        подставляется как В2 * koeff_price (коэффициент из настроек).
         Если строка не выбрана или название не заполнено, показывается
         предупреждение и изменения не вносятся.
         """
@@ -1125,8 +1143,9 @@ class SmetaMainWindow(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Ошибка", "Введите название работы.")
             return
+        p1 = apply_price_koeff(self.ref_work_price1.value(), self.ref_work_price2.value(), self.koeff_price)
         self.db_mgr.update_work(wid, name=name, unit=self.ref_work_unit.text().strip(),
-                                price_1=self.ref_work_price1.value(), price_2=self.ref_work_price2.value())
+                                price_1=p1, price_2=self.ref_work_price2.value())
         self._refresh_works_table()
         self._refresh_works_combo()
         self._refresh_link_works_combo()
@@ -1212,7 +1231,12 @@ class SmetaMainWindow(QMainWindow):
         self.ref_mat_price2.setValue(float(rd['price_2']))
 
     def _on_material_item_changed(self, item):
-        """Сохраняет изменения ячейки таблицы материалов в БД."""
+        """Сохраняет изменения ячейки таблицы материалов в БД.
+
+        При правке цены В2, если цена В1 пустая или равна нулю, цена В1
+        автоматически подставляется как В2 * koeff_price (коэффициент из
+        настроек) и обновляется в таблице.
+        """
         row = item.row()
         col = item.column()
         if col == 0:
@@ -1230,14 +1254,22 @@ class SmetaMainWindow(QMainWindow):
             elif col == 2:
                 self.db_mgr.update_material(mid, unit=val)
             elif col == 3:
-                self.db_mgr.update_material(mid, price_1=to_float(val))
+                price2 = to_float(self.materials_table.item(row, 4).text())
+                price1 = apply_price_koeff(to_float(val), price2, self.koeff_price)
+                self.db_mgr.update_material(mid, price_1=price1)
                 self.materials_table.blockSignals(True)
-                self.materials_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.materials_table.item(row, col).setText(f"{price1:.2f}")
                 self.materials_table.blockSignals(False)
             elif col == 4:
-                self.db_mgr.update_material(mid, price_2=to_float(val))
+                price2 = to_float(val)
+                price1 = to_float(self.materials_table.item(row, 3).text())
+                new_price1 = apply_price_koeff(price1, price2, self.koeff_price)
+                self.db_mgr.update_material(mid, price_2=price2)
                 self.materials_table.blockSignals(True)
-                self.materials_table.item(row, col).setText(f"{to_float(val):.2f}")
+                self.materials_table.item(row, col).setText(f"{price2:.2f}")
+                if new_price1 != price1:
+                    self.db_mgr.update_material(mid, price_1=new_price1)
+                    self.materials_table.item(row, 3).setText(f"{new_price1:.2f}")
                 self.materials_table.blockSignals(False)
             self.db_mgr.flush()
         except Exception as e:
@@ -1246,6 +1278,8 @@ class SmetaMainWindow(QMainWindow):
     def _add_material(self):
         """Добавляет материал из формы в базу и очищает форму.
 
+        Если цена В1 пустая или равна нулю, а цена В2 задана, цена В1
+        подставляется как В2 * koeff_price (коэффициент из настроек).
         Пустое название материала отклоняется с предупреждением.
         """
         name = self.ref_mat_name.text().strip()
@@ -1255,6 +1289,7 @@ class SmetaMainWindow(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Ошибка", "Введите название материала.")
             return
+        p1 = apply_price_koeff(p1, p2, self.koeff_price)
         self.db_mgr.add_material(name, unit, p1, p2)
         self._refresh_materials_table()
         self.statusBar().showMessage(f"Добавлен материал: {name}")
@@ -1263,6 +1298,8 @@ class SmetaMainWindow(QMainWindow):
     def _update_material(self):
         """Обновляет выбранный в таблице материал значениями из формы.
 
+        Если цена В1 пустая или равна нулю, а цена В2 задана, цена В1
+        подставляется как В2 * koeff_price (коэффициент из настроек).
         Требуется выделенная строка таблицы и непустое название материала.
         """
         row = self.materials_table.currentRow()
@@ -1277,8 +1314,9 @@ class SmetaMainWindow(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Ошибка", "Введите название материала.")
             return
+        p1 = apply_price_koeff(self.ref_mat_price1.value(), self.ref_mat_price2.value(), self.koeff_price)
         self.db_mgr.update_material(mid, name=name, unit=self.ref_mat_unit.text().strip(),
-                                     price_1=self.ref_mat_price1.value(), price_2=self.ref_mat_price2.value())
+                                     price_1=p1, price_2=self.ref_mat_price2.value())
         self._refresh_materials_table()
         self.statusBar().showMessage(f"Обновлён материал: {name}")
 
@@ -1371,7 +1409,9 @@ class SmetaMainWindow(QMainWindow):
         """Сохраняет изменения ячейки таблицы связей в БД.
 
         Колонки 2-3 (расход) сохраняются в связь work_materials.
-        Колонки 4-5 (цена) сохраняются в карточку материала.
+        Колонки 4-5 (цена) сохраняются в карточку материала. При правке цены
+        В2, если цена В1 пустая или равна нулю, цена В1 автоматически
+        подставляется как В2 * koeff_price (коэффициент из настроек).
         Колонка 6 (чекбокс) — округление объёма вверх до целого.
         """
         row = item.row()
@@ -1412,9 +1452,18 @@ class SmetaMainWindow(QMainWindow):
                 self.db_mgr.add_work_material_link(work_id, mat_id,
                                                     to_float(self.links_table.item(row, 2).text()), val)
             elif col == 4:
+                price2 = to_float(self.links_table.item(row, 5).text())
+                val = apply_price_koeff(val, price2, self.koeff_price)
                 self.db_mgr.update_material(mat_id, price_1=val)
             elif col == 5:
+                price1 = to_float(self.links_table.item(row, 4).text())
+                new_price1 = apply_price_koeff(price1, val, self.koeff_price)
                 self.db_mgr.update_material(mat_id, price_2=val)
+                if new_price1 != price1:
+                    self.db_mgr.update_material(mat_id, price_1=new_price1)
+                    self.links_table.blockSignals(True)
+                    self.links_table.item(row, 4).setText(f"{new_price1:.2f}")
+                    self.links_table.blockSignals(False)
 
             # Форматируем отображение
             self.links_table.blockSignals(True)
@@ -2374,8 +2423,8 @@ class SmetaMainWindow(QMainWindow):
     # =======================================================================
     def _show_about(self):
         QMessageBox.about(
-            self, "О программе — Сметчик PRO 5.3",
-            "Сметчик PRO 5.3\n\n"
+            self, "О программе — Сметчик PRO 5.3.1",
+            "Сметчик PRO 5.3.1\n\n"
             "Приложение для составления смет с поддержкой двух вариантов цены.\n\n"
             "Автор: Крезуб Павел (@pto_plus) | Лицензия: MIT\n\n"
             "Технологии: Python 3, PyQt6, SQLite, pandas, openpyxl, xlsxwriter\n\n"
@@ -2615,7 +2664,7 @@ def _load_app_icon() -> QIcon:
 
 
 def main():
-    """Запускает приложение «Сметчик PRO 5.3»."""
+    """Запускает приложение «Сметчик PRO 5.3.1»."""
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     icon = _load_app_icon()
