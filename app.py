@@ -481,9 +481,9 @@ class SmetaMainWindow(QMainWindow):
     def _create_menu(self):
         """Создаёт строку меню и связывает пункты с действиями окна.
 
-        Формирует меню «Файл» (черновик, экспорт/импорт Excel, выход),
-        «Правка» (отмена/повтор, добавление работы и раздела, справка) и
-        «Справка» (о программе). Горячие клавиши задаются прямо здесь.
+        Формирует меню «Файл» (черновик, экспорт/импорт Excel, настройки,
+        выход), «Правка» (отмена/повтор, добавление работы и раздела, справка)
+        и «Справка» (о программе). Горячие клавиши задаются прямо здесь.
         """
         menubar = self.menuBar()
 
@@ -502,6 +502,13 @@ class SmetaMainWindow(QMainWindow):
         act = QAction("📥 &Импорт из Excel", self)
         act.setShortcut(QKeySequence("Ctrl+I"))
         act.triggered.connect(self._import_from_excel)
+        file_menu.addAction(act)
+
+        file_menu.addSeparator()
+
+        act = QAction("⚙️ &Настройки", self)
+        act.setShortcut(QKeySequence("Ctrl+,"))
+        act.triggered.connect(self.show_settings)
         file_menu.addAction(act)
 
         file_menu.addSeparator()
@@ -538,7 +545,6 @@ class SmetaMainWindow(QMainWindow):
         edit_menu.addSeparator()
 
         act = QAction("📖 &Справка", self)
-        act.setShortcut(QKeySequence("F1"))
         act.triggered.connect(self._show_about)
         edit_menu.addAction(act)
 
@@ -975,8 +981,20 @@ class SmetaMainWindow(QMainWindow):
         self.link_work_combo.setEditable(True)
         self.link_work_combo.setFixedWidth(700)
         self.link_work_combo.currentTextChanged.connect(self._refresh_links_table)
+        self.link_work_combo.currentTextChanged.connect(self._update_link_work_unit)
         combo_row.addWidget(QLabel("Работа:"))
         combo_row.addWidget(self.link_work_combo)
+
+        # Нередактируемое поле с единицей измерения выбранной работы
+        self.link_work_unit_label = QLabel("—")
+        self.link_work_unit_label.setMinimumWidth(90)
+        self.link_work_unit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.link_work_unit_label.setStyleSheet(
+            "color: #555; background: #f5f5f5; padding: 2px 6px; border-radius: 3px;"
+        )
+        combo_row.addWidget(QLabel("Ед. изм.:"))
+        combo_row.addWidget(self.link_work_unit_label)
+
         combo_row.addStretch()
         layout.addLayout(combo_row)
 
@@ -1367,6 +1385,23 @@ class SmetaMainWindow(QMainWindow):
         elif names:
             self.link_work_combo.setCurrentIndex(0)
         self.link_work_combo.blockSignals(False)
+        self._update_link_work_unit()
+
+    def _update_link_work_unit(self):
+        """Показывает единицу измерения выбранной работы справа от списка работ.
+
+        Для пустого выбора или отсутствующей в справочнике работы выводится
+        прочерк. Поле нередактируемое (QLabel).
+        """
+        wn = self.link_work_combo.currentText().strip()
+        unit = ""
+        if wn:
+            work = self.db_mgr.get_work_by_name(wn)
+            if work is not None:
+                unit = str(work['unit']).strip()
+                if unit.lower() in ("nan", "none"):
+                    unit = ""
+        self.link_work_unit_label.setText(unit if unit else "—")
 
     def _refresh_links_table(self):
         """Перезаполняет таблицу связей материалами выбранной работы.
@@ -2653,11 +2688,22 @@ class SmetaMainWindow(QMainWindow):
 ICON_FILES = ("app.ico", "smeta-icon.png")
 
 
+def _resource_path(name: str) -> str:
+    """Возвращает путь к ресурсу.
+
+    При запуске из собранного exe (PyInstaller) ресурсы лежат во временной
+    папке ``sys._MEIPASS``; при запуске из исходников — рядом со скриптом.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
 def _load_app_icon() -> QIcon:
     """Возвращает иконку приложения: app.ico, при отсутствии — smeta-icon.png."""
     for name in ICON_FILES:
-        if os.path.exists(name):
-            icon = QIcon(name)
+        path = _resource_path(name)
+        if os.path.exists(path):
+            icon = QIcon(path)
             if not icon.isNull():
                 return icon
     return QIcon()

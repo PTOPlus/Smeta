@@ -9,6 +9,9 @@ __pycache__/
 *.bak
 DB.db
 *.spec
+*.bat
 dist/
 build/
 images/
+.venv/
+.buildenv/
