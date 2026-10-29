@@ -7,16 +7,20 @@ app.py — Главный модуль приложения «Сметчик PRO
 import os
 import sys
 import json
+import math
 from datetime import datetime
+
+import pandas as pd
+
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QMessageBox, QFileDialog, QDialog,
     QFormLayout, QHeaderView, QDoubleSpinBox, QMenu,
-    QAbstractItemView, QInputDialog,
+    QAbstractItemView, QInputDialog, QTableView, QProgressBar,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut, QColor
 
 from smeta_core import (
@@ -26,6 +30,7 @@ from smeta_core import (
     SECTION_PREFIX, WORK_PREFIX, TOTAL_PREFIX,
     CALC_HEADERS, COLS,
 )
+from split_form import read_split_form, export_split_prices_to_excel, KIND_MATERIAL, KIND_MACHINE
 from db_manager import DatabaseManager
 
 # ---------------------------------------------------------------------------
@@ -57,6 +62,10 @@ EDITABLE_MAT = {COL_NORM1, COL_PRICE1, COL_NORM2, COL_PRICE2}
 COLUMN_WIDTHS_FILE = "column_widths.json"
 SETTINGS_FILE = "settings.json"
 
+# Ширины колонок таблицы сплит-формы по умолчанию (порядок = SplitPriceTableModel.SPLIT_COLUMNS)
+SPLIT_DEFAULT_WIDTHS = [150, 520, 70, 130, 140, 150, 90, 300]
+
+
 
 def _cell(value, right_align=False):
     """Создаёт ячейку таблицы QTableWidget из значения.
@@ -72,6 +81,221 @@ def _cell(value, right_align=False):
     if right_align:
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     return item
+
+
+# ===========================================================================
+# Модель QAbstractTableModel для QTableView (сплит-форма, 47k+ строк)
+# ===========================================================================
+class SplitPriceTableModel(QAbstractTableModel):
+    """Табличная модель для справочника цен из сплит-формы.
+
+    Поддерживает 8 колонок: code, name, unit, price_no_vat, price_vat,
+    kind, group_code, group_name. Данные хранятся во внутреннем DataFrame,
+    сортировка по клику на заголовок выполняется над pandas (sort()), поэтому
+    цены сравниваются как числа, а порядок сохраняется при смене фильтра.
+
+    Сортировка на уровне модели, а не QSortFilterProxyModel, выбрана
+    намеренно: прокси на каждой сравнительной операции вызывает data(),
+    что на 47 тысячах строк занимает десятки секунд вместо миллисекунд.
+    """
+
+    SPLIT_COLUMNS = ['code', 'name', 'unit', 'price_no_vat', 'price_vat',
+                     'kind', 'group_code', 'group_name']
+    HEADERS = ['Код', 'Наименование', 'Ед. изм.', 'Цена без НДС',
+               'Цена с НДС 22%', 'Тип', 'Группа', 'Наименование группы']
+    # Колонки, которые сортируются как числа (group_code хранится текстом)
+    NUMERIC_COLUMNS = {'price_no_vat', 'price_vat', 'group_code'}
+
+    def __init__(self):
+        """Создаёт пустую модель."""
+        super().__init__()
+        self._all = None      # отфильтрованные данные без сортировки
+        self._data = None     # отображаемые данные (с учётом сортировки)
+        self._sort_col = -1   # -1 — сортировка не применена
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        self._sorting = False  # защита от рекурсии при сбросе модели внутри sort()
+
+    def set_data(self, df):
+        """Полностью заменяет данные модели и применяет активную сортировку.
+
+        Args:
+            df (pd.DataFrame): данные для отображения. Лишние колонки отбрасываются,
+                порядок приводится к SPLIT_COLUMNS.
+        """
+        self.beginResetModel()
+        if df is None or len(df) == 0:
+            self._all = None
+            self._data = None
+        else:
+            cols = [c for c in self.SPLIT_COLUMNS if c in df.columns]
+            self._all = df[cols].reset_index(drop=True)
+            self._data = self._sorted(self._all)
+        self.endResetModel()
+
+    def _sorted(self, df):
+        """Возвращает DataFrame с применённой текущей сортировкой.
+
+        Args:
+            df (pd.DataFrame): исходные (отфильтрованные) данные.
+
+        Returns:
+            pd.DataFrame: отсортированные данные; без активной сортировки — исходные.
+        """
+        if self._sort_col < 0 or self._sort_col >= len(self.SPLIT_COLUMNS) or df.empty:
+            return df
+        col = self.SPLIT_COLUMNS[self._sort_col]
+        if col not in df.columns:
+            return df
+        ascending = (self._sort_order == Qt.SortOrder.AscendingOrder)
+        if col in self.NUMERIC_COLUMNS:
+            key = pd.to_numeric(df[col], errors='coerce')
+        else:
+            key = df[col].astype(str).str.lower()
+        # mergesort — устойчивая сортировка: равные значения сохраняют порядок файла
+        order = key.sort_values(ascending=ascending, kind='mergesort', na_position='last').index
+        return df.loc[order]
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        """Сортирует модель по колонке — вызывается QTableView по клику на заголовок.
+
+        Args:
+            column (int): номер колонки модели.
+            order (Qt.SortOrder): направление сортировки.
+        """
+        if self._sorting:
+            return
+        if column < 0 or column >= len(self.SPLIT_COLUMNS):
+            return
+        self._sort_col = column
+        self._sort_order = order
+        if self._all is None or self._all.empty:
+            return
+        self._sorting = True
+        try:
+            self.beginResetModel()
+            self._data = self._sorted(self._all)
+            self.endResetModel()
+        finally:
+            self._sorting = False
+
+    def clear_sort(self):
+        """Сбрасывает сортировку — данные отображаются в исходном порядке файла."""
+        self._sort_col = -1
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        if self._all is not None:
+            self.beginResetModel()
+            self._data = self._all
+            self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        """Возвращает количество строк."""
+        if self._data is None:
+            return 0
+        return len(self._data)
+
+    def columnCount(self, parent=QModelIndex()):
+        """Возвращает количество колонок."""
+        return len(self.SPLIT_COLUMNS)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        """Возвращает значение ячейки.
+
+        Args:
+            index (QModelIndex): индекс ячейки.
+            role: роль данных.
+
+        Returns:
+            Значение ячейки при DisplayRole, иначе None.
+        """
+        if not index.isValid() or self._data is None:
+            return None
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        row = index.row()
+        col = index.column()
+        if row < 0 or row >= len(self._data) or col >= len(self._data.columns):
+            return None
+        val = self._data.iloc[row, col]
+        if isinstance(val, float):
+            if math.isnan(val):
+                return ""
+            return f"{val:.2f}"
+        return str(val) if val is not None else ""
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        """Возвращает заголовки колонок и номера строк."""
+        if role == Qt.ItemDataRole.DisplayRole:
+            if orientation == Qt.Orientation.Horizontal:
+                return self.HEADERS[section]
+            return str(section + 1)
+        return None
+
+    def flags(self, index):
+        """Возвращает флаги ячеек (только Selectable, не редактируемая)."""
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+
+    def record_at(self, row: int):
+        """Возвращает словарь-запись отображённой строки модели.
+
+        Args:
+            row (int): номер строки в представлении (с учётом сортировки).
+
+        Returns:
+            dict | None: запись или None, если строка вне диапазона.
+        """
+        if self._data is None or row < 0 or row >= len(self._data):
+            return None
+        return self._data.iloc[row].to_dict()
+
+
+# ===========================================================================
+# Потоки для загрузки сплит-формы
+# ===========================================================================
+class SplitFormLoadThread(QThread):
+    """Поток чтения сплит-формы без блокировки интерфейса.
+
+    Сигналы:
+        ready: отправляется когда чтение завершено.
+        error: отправляется при ошибке.
+        progress: отправляется каждые PROGRESS_STEP строк.
+    """
+
+    PROGRESS_STEP = 2000
+    ready = pyqtSignal(list, dict)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+
+    def __init__(self, path: str):
+        """Создаёт поток для чтения файла.
+
+        Args:
+            path (str): путь к файлу .xlsx.
+        """
+        super().__init__()
+        self.path = path
+        self._cancelled = False
+
+    def run(self):
+        """Выполняет чтение сплит-формы."""
+        def progress_fn(processed, total):
+            if self._cancelled:
+                return False
+            self.progress.emit(processed, total)
+            return True
+
+        try:
+            records, stats = read_split_form(self.path, progress_fn)
+            if self._cancelled:
+                stats['cancelled'] = True
+            self.ready.emit(records, stats)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def cancel(self):
+        """Прерывает чтение."""
+        self._cancelled = True
 
 
 # ---------------------------------------------------------------------------
@@ -768,6 +992,9 @@ class SmetaMainWindow(QMainWindow):
         self._create_links_tab()
         self.ref_tabs.addTab(self.links_tab, "Связи")
 
+        self._create_split_prices_tab()
+        self.ref_tabs.addTab(self.split_tab, "Сплит-форма (цены)")
+
         self._refresh_db_list()
 
     # =======================================================================
@@ -842,6 +1069,7 @@ class SmetaMainWindow(QMainWindow):
         self._refresh_materials_table()
         self._refresh_link_works_combo()
         self._refresh_works_combo()
+        self._refresh_split_view()
         self.statusBar().showMessage(f"Активная база: {os.path.join(folder, name + '.db')}")
 
     def _create_works_table_tab(self):
@@ -1021,9 +1249,285 @@ class SmetaMainWindow(QMainWindow):
 
         self._refresh_link_works_combo()
 
-    # =======================================================================
-    # РАБОТЫ: refresh, filter, CRUD
-    # =======================================================================
+    # ===========================================================================
+    # Вкладка «Сплит-форма (цены)»
+    # ===========================================================================
+    def _create_split_prices_tab(self):
+        """Собирает вкладку «Сплит-форма (цены)» справочника.
+
+        Создаёт таблицу QTableView с моделью SplitPriceTableModel,
+        поля поиска и фильтра по типу, кнопки управления.
+        """
+        self.split_tab = QWidget()
+        layout = QVBoxLayout(self.split_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Панель управления
+        ctrl = QHBoxLayout()
+
+        # Фильтр по типу
+        self.split_kind_combo = QComboBox()
+        self.split_kind_combo.addItems(["Все", KIND_MATERIAL, KIND_MACHINE])
+        self.split_kind_combo.currentTextChanged.connect(self._refresh_split_view)
+        ctrl.addWidget(QLabel("Тип:"))
+        ctrl.addWidget(self.split_kind_combo)
+
+        # Поиск
+        self.split_filter_edit = QLineEdit()
+        self.split_filter_edit.setPlaceholderText("Поиск по названию, коду, группе...")
+        self.split_filter_edit.setFixedWidth(350)
+        ctrl.addWidget(QLabel("Поиск:"))
+        ctrl.addWidget(self.split_filter_edit)
+        ctrl.addStretch()
+
+        # Задержка применения поиска — 47k строк фильтровать на каждое нажатие затратно
+        self._split_filter_timer = QTimer(self)
+        self._split_filter_timer.setSingleShot(True)
+        self._split_filter_timer.setInterval(350)
+        self._split_filter_timer.timeout.connect(self._refresh_split_view)
+        self.split_filter_edit.textChanged.connect(self._split_filter_timer.start)
+
+        self.split_count_label = QLabel("Записей: 0")
+        self.split_count_label.setStyleSheet("color: #555;")
+        ctrl.addWidget(self.split_count_label)
+        layout.addLayout(ctrl)
+
+        # Таблица с сортировкой по клику на заголовок
+        self.split_table = QTableView()
+        self._split_model = SplitPriceTableModel()
+        self.split_table.setModel(self._split_model)
+        self.split_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.split_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.split_table.setWordWrap(False)
+        self.split_table.verticalHeader().setVisible(False)
+        self.split_table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.split_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.split_table.horizontalHeader().setStretchLastSection(True)
+        self.split_table.setAlternatingRowColors(True)
+        # Сортировка по нажатию на заголовок (повторный клик — обратный порядок).
+        # Обработка — в SplitPriceTableModel.sort(): сортировка DataFrame
+        # вместо QSortFilterProxyModel, который на 47k строк сравнивает ячейки
+        # через data() и сортирует десятки секунд.
+        self.split_table.setSortingEnabled(True)
+        # Начальное состояние — без сортировки (порядок файла), иначе Qt
+        # ставит индикатор на первой колонке и подсвечивает её без причины
+        self.split_table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        # Ширины колонок: значения по умолчанию, далее их перезапишет _load_column_widths
+        for c, w in enumerate(SPLIT_DEFAULT_WIDTHS):
+            self.split_table.setColumnWidth(c, w)
+        self.split_table.horizontalHeader().sectionResized.connect(self._save_column_widths)
+        layout.addWidget(self.split_table)
+
+        # Прогресс загрузки
+        prog_row = QHBoxLayout()
+        self.split_progress = QProgressBar()
+        self.split_progress.setFixedHeight(20)
+        self.split_progress.setVisible(False)
+        prog_row.addWidget(self.split_progress, 1)
+        self.split_cancel_btn = QPushButton("✖ Отмена")
+        self.split_cancel_btn.setFixedWidth(90)
+        self.split_cancel_btn.setVisible(False)
+        self.split_cancel_btn.clicked.connect(self._cancel_split_load)
+        prog_row.addWidget(self.split_cancel_btn)
+        layout.addLayout(prog_row)
+
+        # Кнопки
+        btn_row = QHBoxLayout()
+        btn_load = QPushButton("📥 Загрузить сплит-форму"); btn_load.clicked.connect(self._load_split_form)
+        btn_export = QPushButton("📤 Выгрузить в Excel"); btn_export.clicked.connect(self._export_split_prices)
+        btn_clear = QPushButton("🗑 Очистить"); btn_clear.clicked.connect(self._clear_split_prices)
+        btn_transfer = QPushButton("➡️ Перенести в справочник"); btn_transfer.clicked.connect(self._transfer_split_to_materials)
+        btn_row.addWidget(btn_load)
+        btn_row.addWidget(btn_export)
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_transfer)
+        layout.addLayout(btn_row)
+
+        # Поток загрузки
+        self.split_load_thread = None
+
+        # Первоначальное заполнение данными из текущей базы
+        self._refresh_split_view()
+
+    def _refresh_split_view(self):
+        """Перезаполняет таблицу сплит-формы отфильтрованными данными.
+
+        Сортировка по колонке сохраняется, ширины колонок не меняются —
+        они задаются один раз (или восстанавливаются из column_widths.json).
+        """
+        query = self.split_filter_edit.text().strip()
+        kind = self.split_kind_combo.currentText().strip()
+        kind = kind if kind != "Все" else ""
+
+        df = self.db_mgr.search_split_prices(query, kind)
+        self._split_model.set_data(df)
+        self.split_count_label.setText(f"Записей: {df.shape[0]}")
+
+    def _load_split_form(self):
+        """Открывает диалог выбора файла и запускает загрузку в отдельном потоке."""
+        if self.split_load_thread is not None and self.split_load_thread.isRunning():
+            QMessageBox.warning(self, "Ошибка", "Загрузка уже выполняется.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл сплит-формы", self.export_folder, "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+
+        self.split_progress.setVisible(True)
+        self.split_cancel_btn.setVisible(True)
+        self.split_progress.setRange(0, 0)  # индикатор ожидания до первой пачки строк
+        self.statusBar().showMessage("Загрузка сплит-формы...")
+
+        self.split_load_thread = SplitFormLoadThread(path)
+        self.split_load_thread.progress.connect(self._on_split_load_progress)
+        self.split_load_thread.ready.connect(self._on_split_load_ready)
+        self.split_load_thread.error.connect(self._on_split_load_error)
+        self.split_load_thread.finished.connect(self._on_split_load_finished)
+        self.split_load_thread.start()
+
+    def _cancel_split_load(self):
+        """Запрашивает отмену идущей загрузки сплит-формы."""
+        if self.split_load_thread is not None and self.split_load_thread.isRunning():
+            self.split_load_thread.cancel()
+            self.split_cancel_btn.setEnabled(False)
+            self.statusBar().showMessage("Отмена загрузки...")
+
+    def _on_split_load_progress(self, processed, total):
+        """Обновляет прогресс-бар при чтении сплит-формы."""
+        if self.split_progress.maximum() == 0:
+            self.split_progress.setRange(0, max(total, 1))
+        self.split_progress.setValue(processed)
+        self.statusBar().showMessage(f"Загрузка: {processed:,} из {total:,} строк")
+
+    def _on_split_load_ready(self, records, stats):
+        """Обрабатывает успешное завершение загрузки сплит-формы."""
+        if stats.get('cancelled'):
+            self.statusBar().showMessage("Загрузка отменена — данные не изменены")
+            return
+
+        # Показываем пользователю, что происходит (на флешке commit может занять 7-8 сек)
+        self.statusBar().showMessage("Сохранение в базу...")
+        QApplication.processEvents()
+
+        # Сохраняем в базу быстрым пакетным путём
+        self.db_mgr.set_split_prices(records)
+        self.db_mgr.save_split_prices_now()
+
+        self._refresh_split_view()
+        msg = (f"Загружено записей: {stats['imported']:,}\n"
+               f"Пропущено тарифов на перевозку: {stats['transport']:,}\n"
+               f"Пропущено оплаты труда: {stats['labor']:,}\n"
+               f"Без цены (прочерки): {stats['no_price']:,}")
+        self.statusBar().showMessage(
+            f"Сплит-форма: {stats['imported']:,} записей с НДС 22%"
+        )
+        QMessageBox.information(self, "Загрузка завершена", msg)
+
+    def _on_split_load_error(self, error_msg):
+        """Обработка ошибки при загрузке сплит-формы."""
+        self.statusBar().showMessage(f"Ошибка загрузки: {error_msg}")
+        QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось загрузить файл:\n{error_msg}")
+
+    def _on_split_load_finished(self):
+        """Завершает загрузку: скрывает прогресс и кнопку отмены."""
+        self.split_progress.setVisible(False)
+        self.split_cancel_btn.setVisible(False)
+        self.split_cancel_btn.setEnabled(True)
+        self.split_load_thread = None
+
+    def _export_split_prices(self):
+        """Выгружает справочник цен из сплит-формы в Excel."""
+        df = self.db_mgr.get_split_prices()
+        if df.empty:
+            QMessageBox.warning(self, "Ошибка", "Справочник цен пуст. Сначала загрузите сплит-форму.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить справочник цен", self.export_folder, "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.xlsx'):
+            path += '.xlsx'
+
+        try:
+            export_split_prices_to_excel(df, path)
+            self.statusBar().showMessage(f"Выгрузка: {path}")
+            QMessageBox.information(self, "Выгрузка", f"Справочник сохранён:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка выгрузки", str(e))
+
+    def _clear_split_prices(self):
+        """Очищает справочник цен из сплит-формы."""
+        reply = QMessageBox.question(
+            self, "Подтверждение",
+            "Очистить весь справочник цен сплит-формы?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.db_mgr.clear_split_prices()
+        self.db_mgr.save_split_prices_now()
+        self._refresh_split_view()
+        self.statusBar().showMessage("Справочник цен очищен")
+
+    def _split_record_at(self, view_row: int):
+        """Возвращает запись таблицы сплит-формы по номеру строки в представлении.
+
+        Сортировка выполняется внутри модели, поэтому номер строки в QTableView
+        совпадает с номером строки модели.
+
+        Args:
+            view_row (int): номер строки в представлении (видимая сортировка).
+
+        Returns:
+            dict | None: запись или None, если строка вне диапазона.
+        """
+        return self._split_model.record_at(view_row)
+
+    def _transfer_split_to_materials(self):
+        """Переносит выделенные позиции из сплит-формы в справочник материалов.
+
+        Для каждой выделенной строки создаёт или обновляет материал:
+        name, unit из сплит-формы; price_1 = price_2 = price_vat (с НДС 22%).
+        """
+        sel = self.split_table.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.warning(self, "Ошибка", "Выделите строки для переноса.")
+            return
+
+        items = []
+        for row_index in sel:
+            rec = self._split_record_at(row_index.row())
+            if rec is None:
+                continue
+            name = str(rec['name']).strip()
+            if not name:
+                continue
+            items.append({
+                'name': name,
+                'unit': str(rec['unit']).strip(),
+                'price_1': float(rec['price_vat'] or 0.0),
+                'price_2': float(rec['price_vat'] or 0.0),
+            })
+
+        if not items:
+            QMessageBox.warning(self, "Ошибка", "В выделении нет корректных записей.")
+            return
+
+        added, updated = self.db_mgr.upsert_materials_bulk(items)
+        self.db_mgr.flush()
+        self._refresh_materials_table()
+        self.statusBar().showMessage(f"Перенесено: добавлено {added}, обновлено {updated}")
+        QMessageBox.information(self, "Перенос завершён",
+                                f"Добавлено материалов: {added}\n"
+                                f"Обновлено материалов: {updated}")
+
     def _refresh_works_table(self):
         """Перезаполняет таблицу работ данными из текущей базы.
 
@@ -2312,18 +2816,19 @@ class SmetaMainWindow(QMainWindow):
     def _save_column_widths(self):
         """Сохраняет ширины колонок всех таблиц в JSON-файл.
         
-        Собирает текущие ширины колонок пяти таблиц (smeta_table, works_table,
-        materials_table, links_table, extra_table) и записывает их в файл
-        column_widths.json в папке базы данных. Вызывается при изменении ширины
-        любой колонки (сигнал sectionResized) и при закрытии окна.
+        Собирает текущие ширины колонок шести таблиц (smeta_table, works_table,
+        materials_table, links_table, extra_table, split_table) и записывает их в
+        файл column_widths.json в папке базы данных. Вызывается при изменении
+        ширины любой колонки (сигнал sectionResized) и при закрытии окна.
         """
         try:
             widths = {
-                "smeta_table": [self.smeta_table.columnWidth(c) for c in range(self.smeta_table.columnCount())],
-                "works_table": [self.works_table.columnWidth(c) for c in range(self.works_table.columnCount())],
-                "materials_table": [self.materials_table.columnWidth(c) for c in range(self.materials_table.columnCount())],
-                "links_table": [self.links_table.columnWidth(c) for c in range(self.links_table.columnCount())],
-                "extra_table": [self.extra_table.columnWidth(c) for c in range(self.extra_table.columnCount())],
+                "smeta_table": self._get_widths(self.smeta_table),
+                "works_table": self._get_widths(self.works_table),
+                "materials_table": self._get_widths(self.materials_table),
+                "links_table": self._get_widths(self.links_table),
+                "extra_table": self._get_widths(self.extra_table),
+                "split_table": self._get_widths(self.split_table),
             }
             path = os.path.join(self.db_folder, COLUMN_WIDTHS_FILE)
             with open(path, "w", encoding="utf-8") as f:
@@ -2331,11 +2836,41 @@ class SmetaMainWindow(QMainWindow):
         except Exception:
             pass
 
+    @staticmethod
+    def _column_count(table):
+        """Возвращает количество колонок таблицы для любого её типа.
+
+        У QTableWidget есть собственный метод columnCount(), у QTableView его
+        нет — число колонок берётся из модели.
+
+        Args:
+            table (QTableWidget | QTableView): таблица.
+
+        Returns:
+            int: количество колонок (0, если модель ещё не установлена).
+        """
+        if isinstance(table, QTableWidget):
+            return table.columnCount()
+        model = table.model()
+        return model.columnCount() if model is not None else 0
+
+    @classmethod
+    def _get_widths(cls, table):
+        """Возвращает список текущих ширин колонок таблицы.
+
+        Args:
+            table (QTableWidget | QTableView): таблица.
+
+        Returns:
+            list[int]: ширины колонок в пикселях.
+        """
+        return [table.columnWidth(c) for c in range(cls._column_count(table))]
+
     def _load_column_widths(self):
         """Загружает ширины колонок всех таблиц из JSON-файла.
         
         Читает файл column_widths.json из папки базы данных и применяет
-        сохранённые ширины ко всем пяти таблицам. Если файл отсутствует
+        сохранённые ширины ко всем шести таблицам. Если файл отсутствует
         или повреждён, метод завершается без ошибок. Вызывается при
         инициализации главного окна.
         """
@@ -2351,20 +2886,21 @@ class SmetaMainWindow(QMainWindow):
             self._apply_widths(self.materials_table, widths.get("materials_table"))
             self._apply_widths(self.links_table, widths.get("links_table"))
             self._apply_widths(self.extra_table, widths.get("extra_table"))
+            self._apply_widths(self.split_table, widths.get("split_table"))
         except Exception:
             pass
 
-    @staticmethod
-    def _apply_widths(table, widths):
+    @classmethod
+    def _apply_widths(cls, table, widths):
         """Применяет список ширин к таблице, если количество колонок совпадает.
         
         Args:
-            table (QTableWidget): таблица, к которой применяются ширины.
+            table (QTableWidget | QTableView): таблица, к которой применяются ширины.
             widths (list[int] | None): список ширин колонок в пикселях.
                 Если None или длина не совпадает с количеством колонок таблицы,
                 метод завершается без изменений.
         """
-        if widths is None or len(widths) != table.columnCount():
+        if widths is None or len(widths) != cls._column_count(table):
             return
         for col, w in enumerate(widths):
             try:

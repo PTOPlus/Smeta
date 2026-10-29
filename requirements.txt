@@ -2,3 +2,5 @@ pandas
 openpyxl
 xlsxwriter
 PyQt6
+python_calamine
+pillow

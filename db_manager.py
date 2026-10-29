@@ -13,6 +13,9 @@ from typing import Optional, Dict
 WORKS_COLS = ['id', 'name', 'unit', 'price_1', 'price_2']
 MATERIALS_COLS = ['id', 'name', 'unit', 'price_1', 'price_2']
 WORK_MATERIALS_COLS = ['work_id', 'material_id', 'consumption_1', 'consumption_2', 'round_up']
+# Справочник цен из сплит-формы (цены без НДС и с НДС 22%)
+SPLIT_PRICES_COLS = ['id', 'code', 'name', 'unit', 'price_no_vat', 'price_vat',
+                     'kind', 'group_code', 'group_name']
 
 # Старый формат (для миграции и совместимости)
 LEGACY_COLS = ['Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм',
@@ -63,11 +66,13 @@ class DatabaseManager:
         self.works_cache: Optional[pd.DataFrame] = None
         self.materials_cache: Optional[pd.DataFrame] = None
         self.work_materials_cache: Optional[pd.DataFrame] = None
+        self.split_prices_cache: Optional[pd.DataFrame] = None
 
         # Флаги изменений (dirty flags)
         self.works_dirty = False
         self.materials_dirty = False
         self.work_materials_dirty = False
+        self.split_prices_dirty = False
 
         # Подключаемся к SQLite
         self.conn = sqlite3.connect(self.sqlite_path)
@@ -99,12 +104,13 @@ class DatabaseManager:
         self._create_empty_db()
 
     def _create_tables(self):
-        """Создаёт таблицы SQLite (works, materials, work_materials), если они не существуют.
+        """Создаёт таблицы SQLite (works, materials, work_materials, split_prices), если они не существуют.
         
         Таблицы:
             - works: работы с id, name, unit, price_1, price_2
             - materials: материалы с id, name, unit, price_1, price_2
             - work_materials: связи между работами и материалами с FK и CASCADE
+            - split_prices: справочник цен из сплит-формы (цены без НДС и с НДС 22%)
         """
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS works (
@@ -133,6 +139,18 @@ class DatabaseManager:
                 FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
                 FOREIGN KEY (material_id) REFERENCES materials(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS split_prices (
+                id INTEGER PRIMARY KEY,
+                code TEXT,
+                name TEXT NOT NULL,
+                unit TEXT,
+                price_no_vat REAL DEFAULT 0.0,
+                price_vat REAL DEFAULT 0.0,
+                kind TEXT,
+                group_code TEXT,
+                group_name TEXT
+            );
         """)
 
     def _load_from_sqlite(self):
@@ -153,6 +171,7 @@ class DatabaseManager:
         self.works_cache = pd.read_sql_query("SELECT * FROM works", self.conn)
         self.materials_cache = pd.read_sql_query("SELECT * FROM materials", self.conn)
         self.work_materials_cache = pd.read_sql_query("SELECT * FROM work_materials", self.conn)
+        self.split_prices_cache = pd.read_sql_query("SELECT * FROM split_prices", self.conn)
 
         # Убедимся, что колонка round_up присутствует (для старых БД после ALTER)
         if 'round_up' not in self.work_materials_cache.columns:
@@ -167,9 +186,17 @@ class DatabaseManager:
             if col in self.work_materials_cache.columns:
                 self.work_materials_cache[col] = pd.to_numeric(self.work_materials_cache[col], errors='coerce').fillna(0.0)
 
+        if 'price_no_vat' in self.split_prices_cache.columns:
+            self.split_prices_cache['price_no_vat'] = pd.to_numeric(
+                self.split_prices_cache['price_no_vat'], errors='coerce').fillna(0.0)
+        if 'price_vat' in self.split_prices_cache.columns:
+            self.split_prices_cache['price_vat'] = pd.to_numeric(
+                self.split_prices_cache['price_vat'], errors='coerce').fillna(0.0)
+
         self.works_dirty = False
         self.materials_dirty = False
         self.work_materials_dirty = False
+        self.split_prices_dirty = False
 
     def _migrate_from_excel(self):
         """Мигрирует данные из legacy Excel-файла в нормализованную структуру SQLite.
@@ -250,9 +277,10 @@ class DatabaseManager:
         self.works_cache = pd.DataFrame(works_list, columns=WORKS_COLS) if works_list else pd.DataFrame(columns=WORKS_COLS)
         self.materials_cache = pd.DataFrame(materials_list, columns=MATERIALS_COLS) if materials_list else pd.DataFrame(columns=MATERIALS_COLS)
         self.work_materials_cache = pd.DataFrame(links_list, columns=WORK_MATERIALS_COLS) if links_list else pd.DataFrame(columns=WORK_MATERIALS_COLS)
+        self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
 
         # Сохраняем в SQLite
-        self._save_to_sqlite()
+        self._save_to_sqlite(force=True)
 
         # Резервная копия исходного Excel
         backup_path = self.legacy_path.rsplit('.', 1)[0] + '_backup.xlsx'
@@ -272,14 +300,19 @@ class DatabaseManager:
         self.works_cache = pd.DataFrame(columns=WORKS_COLS)
         self.materials_cache = pd.DataFrame(columns=MATERIALS_COLS)
         self.work_materials_cache = pd.DataFrame(columns=WORK_MATERIALS_COLS)
-        self._save_to_sqlite()
+        self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
+        self._save_to_sqlite(force=True)
 
-    def _save_to_sqlite(self):
-        """Сохраняет все кэшированные данные в SQLite.
+    def _save_to_sqlite(self, force: bool = False):
+        """Сохраняет изменённые кэшированные данные в SQLite.
         
         Перед записью создаёт резервную копию существующего .db файла.
         Отключает foreign keys на время перезаписи таблиц, затем включает обратно.
         Сбрасывает все dirty-флаги после успешного сохранения.
+        
+        Args:
+            force (bool): записать все таблицы независимо от dirty-флагов
+                (используется при создании и миграции базы).
         """
         os.makedirs(self.db_folder, exist_ok=True)
 
@@ -298,21 +331,27 @@ class DatabaseManager:
         # ВАЖНО: отключаем foreign keys для корректной замены таблиц
         self.conn.execute("PRAGMA foreign_keys=OFF")
 
+        def write_table(cache, table_name, columns):
+            """Перезаписывает одну таблицу содержимым кэша."""
+            if cache is None:
+                return
+            if not cache.empty:
+                cache.to_sql(table_name, self.conn, if_exists='replace', index=False)
+            else:
+                self.conn.execute(f"DELETE FROM {table_name}")
+
         try:
-            if not self.works_cache.empty:
-                self.works_cache.to_sql('works', self.conn, if_exists='replace', index=False)
-            else:
-                self.conn.execute("DELETE FROM works")
+            if force or self.works_dirty:
+                write_table(self.works_cache, 'works', WORKS_COLS)
 
-            if not self.materials_cache.empty:
-                self.materials_cache.to_sql('materials', self.conn, if_exists='replace', index=False)
-            else:
-                self.conn.execute("DELETE FROM materials")
+            if force or self.materials_dirty:
+                write_table(self.materials_cache, 'materials', MATERIALS_COLS)
 
-            if not self.work_materials_cache.empty:
-                self.work_materials_cache.to_sql('work_materials', self.conn, if_exists='replace', index=False)
-            else:
-                self.conn.execute("DELETE FROM work_materials")
+            if force or self.work_materials_dirty:
+                write_table(self.work_materials_cache, 'work_materials', WORK_MATERIALS_COLS)
+
+            if force or self.split_prices_dirty:
+                write_table(self.split_prices_cache, 'split_prices', SPLIT_PRICES_COLS)
         finally:
             self.conn.execute("PRAGMA foreign_keys=ON")
 
@@ -321,13 +360,15 @@ class DatabaseManager:
         self.works_dirty = False
         self.materials_dirty = False
         self.work_materials_dirty = False
+        self.split_prices_dirty = False
 
     def flush(self):
         """Принудительно сохраняет все изменения на диск.
         
         Проверяет dirty-флаги и вызывает _save_to_sqlite() при наличии изменений.
         """
-        if self.works_dirty or self.materials_dirty or self.work_materials_dirty:
+        if (self.works_dirty or self.materials_dirty
+                or self.work_materials_dirty or self.split_prices_dirty):
             self._save_to_sqlite()
 
     # -------------------------------------------------------------------------
@@ -470,6 +511,68 @@ class DatabaseManager:
         self.materials_dirty = True
         self.work_materials_dirty = True
 
+    def upsert_materials_bulk(self, items: list) -> tuple:
+        """Пакетно добавляет или обновляет материалы (без зависания на больших объёмах).
+
+        Args:
+            items (list[dict]): список записей с ключами name, unit, price_1, price_2.
+
+        Returns:
+            tuple(int, int): (количество добавленных, количество обновлённых).
+        """
+        if not items:
+            return 0, 0
+
+        if self.materials_cache is None:
+            self.materials_cache = pd.DataFrame(columns=MATERIALS_COLS)
+
+        df = self.materials_cache
+        existing = {}
+        if not df.empty:
+            ids = df['id'].tolist()
+            names = df['name'].astype(str).str.strip().tolist()
+            for pos, n in enumerate(names):
+                if n not in existing:
+                    existing[n] = int(ids[pos])
+
+        new_id = int(df['id'].max()) + 1 if not df.empty else 1
+        to_add = []
+        updates = {}
+
+        for it in items:
+            name = str(it.get('name', '')).strip()
+            if not name:
+                continue
+            unit = str(it.get('unit', '')).strip()
+            p1 = float(it.get('price_1', 0.0) or 0.0)
+            p2 = float(it.get('price_2', 0.0) or 0.0)
+            if name in existing:
+                updates[existing[name]] = (unit, p1, p2)
+            else:
+                existing[name] = new_id
+                to_add.append({
+                    'id': new_id, 'name': name, 'unit': unit,
+                    'price_1': p1, 'price_2': p2,
+                })
+                new_id += 1
+
+        if updates:
+            upd = pd.DataFrame([
+                {'id': mid, 'unit': vals[0], 'price_1': vals[1], 'price_2': vals[2]}
+                for mid, vals in updates.items()
+            ]).set_index('id')
+            base = df.set_index('id')
+            base.update(upd)
+            self.materials_cache = base.reset_index()[MATERIALS_COLS]
+            df = self.materials_cache
+
+        if to_add:
+            self.materials_cache = pd.concat(
+                [df, pd.DataFrame(to_add, columns=MATERIALS_COLS)], ignore_index=True)
+
+        self.materials_dirty = True
+        return len(to_add), len(updates)
+
     # -------------------------------------------------------------------------
     # Методы для работы со связями
     # -------------------------------------------------------------------------
@@ -554,6 +657,146 @@ class DatabaseManager:
         """
         self.work_materials_cache = self.work_materials_cache[self.work_materials_cache['work_id'] != work_id]
         self.work_materials_dirty = True
+
+    # -------------------------------------------------------------------------
+    # Справочник цен из сплит-формы
+    # -------------------------------------------------------------------------
+
+    def get_split_prices(self) -> pd.DataFrame:
+        """Возвращает копию кэша справочника цен из сплит-формы.
+
+        Returns:
+            pd.DataFrame: копия таблицы split_prices.
+        """
+        if self.split_prices_cache is None:
+            return pd.DataFrame(columns=SPLIT_PRICES_COLS)
+        return self.split_prices_cache.copy()
+
+    def count_split_prices(self) -> int:
+        """Возвращает количество записей в справочнике цен.
+
+        Returns:
+            int: число позиций (0, если справочник пуст).
+        """
+        if self.split_prices_cache is None:
+            return 0
+        return int(len(self.split_prices_cache))
+
+    def set_split_prices(self, records: list) -> int:
+        """Полностью заменяет справочник цен записями из сплит-формы.
+
+        Args:
+            records (list[dict]): список записей с ключами code, name, unit,
+                price_no_vat, price_vat, kind, group_code, group_name.
+
+        Returns:
+            int: количество записей, загруженных в справочник.
+        """
+        if records:
+            df = pd.DataFrame(records)
+            df.insert(0, 'id', range(1, len(df) + 1))
+            for col in SPLIT_PRICES_COLS:
+                if col not in df.columns:
+                    df[col] = 0.0 if col in ('price_no_vat', 'price_vat') else ''
+            self.split_prices_cache = df[SPLIT_PRICES_COLS].copy()
+        else:
+            self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
+        self.split_prices_dirty = True
+        return len(self.split_prices_cache)
+
+    def save_split_prices_now(self):
+        """Заменяет таблицу split_prices в SQLite прямым пакетным INSERT.
+
+        Быстрее и корректнее, чем `to_sql(if_exists='replace')`: вставка занимает
+        сотые доли секунды (время определяет только commit на медленном носителе),
+        а схема таблицы с PRIMARY KEY сохраняется. Сбрасывает dirty-флаг.
+        """
+        if self.split_prices_cache is None:
+            self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
+
+        cols = SPLIT_PRICES_COLS
+        rows = list(self.split_prices_cache[cols].itertuples(index=False, name=None))
+
+        self.conn.execute("DELETE FROM split_prices")
+        if rows:
+            self.conn.executemany(
+                "INSERT INTO split_prices (id, code, name, unit, price_no_vat,"
+                " price_vat, kind, group_code, group_name)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        self.conn.commit()
+        self.split_prices_dirty = False
+
+    def clear_split_prices(self):
+        """Очищает справочник цен из сплит-формы."""
+        self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
+        self.split_prices_dirty = True
+
+    def add_split_price(self, code: str, name: str, unit: str, price_no_vat: float,
+                        price_vat: float, kind: str = '', group_code: str = '',
+                        group_name: str = '') -> int:
+        """Добавляет одну позицию в справочник цен.
+
+        Args:
+            code (str): код ресурса из сплит-формы.
+            name (str): наименование.
+            unit (str): единица измерения.
+            price_no_vat (float): цена без НДС.
+            price_vat (float): цена с НДС 22%.
+            kind (str): тип позиции ('материал'/'машина').
+            group_code (str): номер группы однородных ресурсов.
+            group_name (str): наименование группы.
+
+        Returns:
+            int: id новой записи.
+        """
+        if self.split_prices_cache is None:
+            self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
+        new_id = int(self.split_prices_cache['id'].max()) + 1 if not self.split_prices_cache.empty else 1
+        new_row = pd.DataFrame([{
+            'id': new_id, 'code': code, 'name': name, 'unit': unit,
+            'price_no_vat': price_no_vat, 'price_vat': price_vat,
+            'kind': kind, 'group_code': group_code, 'group_name': group_name,
+        }])
+        self.split_prices_cache = pd.concat([self.split_prices_cache, new_row], ignore_index=True)
+        self.split_prices_dirty = True
+        return new_id
+
+    def delete_split_price(self, price_id: int):
+        """Удаляет позицию справочника цен по id.
+
+        Args:
+            price_id (int): id записи для удаления.
+        """
+        if self.split_prices_cache is None:
+            return
+        self.split_prices_cache = self.split_prices_cache[self.split_prices_cache['id'] != price_id]
+        self.split_prices_dirty = True
+
+    def search_split_prices(self, query: str = '', kind: str = '') -> pd.DataFrame:
+        """Ищет позиции справочника цен по коду, названию или группе.
+
+        Args:
+            query (str): поисковый запрос (регистронезависимая подстрока).
+                Пустая строка — не ограничивать результат по тексту.
+            kind (str): фильтр по типу ('материал', 'машина') или '' — все.
+
+        Returns:
+            pd.DataFrame: найденные строки справочника цен.
+        """
+        df = self.get_split_prices()
+        if df.empty:
+            return df
+        if kind:
+            df = df[df['kind'].astype(str) == kind]
+        q = (query or '').strip().lower()
+        if q:
+            mask = (df['name'].astype(str).str.lower().str.contains(q, na=False)
+                    | df['code'].astype(str).str.lower().str.contains(q, na=False)
+                    | df['group_name'].astype(str).str.lower().str.contains(q, na=False))
+            df = df[mask]
+        return df
 
     # -------------------------------------------------------------------------
     # Методы для обратной совместимости
