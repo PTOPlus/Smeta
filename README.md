@@ -60,4 +60,8 @@
 
 Версия: 5.4.0
 Разработчик: @pto_plus
+<<<<<<< HEAD
 Поддержка: <vremyanca@list.ru>
+=======
+Поддержка: <vremyanca@list.ru>
+>>>>>>> e9b45c59cdd4e75fefa5a8d74cb5e783404f5711

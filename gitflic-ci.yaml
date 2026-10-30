@@ -1,0 +1,18 @@
+# Данный файл - шаблонная конфигурация CI/CD конвейера. Он может быть изменен по Вашему усмотрению. 
+# Некоторые шаблоны требуют предварительной настройки перед запуском.
+#
+# Подробнее о синтаксисе можно узнать в документации:
+# https://docs.gitflic.ru/cicd/gitflic-ci-yaml
+
+image: ubuntu:latest
+
+stages:
+  - sync
+
+sync_github:
+  stage: sync
+  script:
+    - git config --global user.name "GitFlic CI"
+    - git config --global user.email "ci@gitflic.com"
+    - git clone --mirror "https://github.com/PTOPlus/Smeta.git" .
+    - git push --mirror "https://\${GITHUB_TOKEN}@github.com/PTOPlus/Smeta.git"
