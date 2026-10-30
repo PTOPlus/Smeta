@@ -15,6 +15,6 @@ sync_github:
     - git config --global user.name "GitFlic CI"
     - git config --global user.email "ci@gitflic.com"
     - git clone --mirror "https://github.com/PTOPlus/Smeta.git" .
-    - git push --mirror "https://$GITHUB_TOKEN@github.com/PTOPlus/Smeta.git"
+    - git push --mirror "https://\${GITHUB_TOKEN}@github.com/PTOPlus/Smeta.git"
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: \$CI_PIPELINE_SOURCE == "schedule"
