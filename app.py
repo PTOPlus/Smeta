@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Главный модуль приложения «Сметчик PRO 5.4.0» (PyQt6).
+app.py — Главный модуль приложения «Сметчик PRO» (PyQt6).
 Графический интерфейс: два таба — «Составление сметы» и «Справочник».
 Управление базами, черновик, настройки, экспорт/импорт.
 """
@@ -36,6 +36,12 @@ from db_manager import DatabaseManager
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
+# Название и версия приложения. Единственное место, где задаётся номер версии:
+# заголовок окна, диалог «О программе» и другие надписи берут значения отсюда.
+APP_NAME = "Сметчик PRO"
+APP_VERSION = "5.4.1"
+APP_TITLE = f"{APP_NAME} {APP_VERSION}"
+
 DRAFT_FILE = "smeta_draft.json"
 WINDOW_SIZE = (1500, 900)
 FONT_FAMILY = "Segoe UI"
@@ -568,10 +574,11 @@ class SectionDialog(QDialog):
 # Главное окно
 # ---------------------------------------------------------------------------
 class SmetaMainWindow(QMainWindow):
-    """Главное окно приложения «Сметчик PRO 5.4.0».
+    """Главное окно приложения «Сметчик PRO».
 
     Содержит две вкладки — «Составление сметы» и «Справочник», — а также
     работу с базами данных, черновиком, настройками и экспортом/импортом Excel.
+    Название окна и версия берутся из константы APP_TITLE.
     """
 
     def __init__(self):
@@ -583,7 +590,7 @@ class SmetaMainWindow(QMainWindow):
         ширины колонок и геометрия окна.
         """
         super().__init__()
-        self.setWindowTitle("Сметчик PRO 5.4.0")
+        self.setWindowTitle(APP_TITLE)
         self.resize(*WINDOW_SIZE)
 
         # --- Состояние ---
@@ -609,8 +616,9 @@ class SmetaMainWindow(QMainWindow):
 
         # Черновик: состояние на момент запуска (для выхода без сохранения)
         self._skip_draft_save_on_close = False
-        self._startup_draft_state = None
         self._startup_draft_path = None
+        self._startup_draft_snapshot = None  # байты файла черновика на старте (None — файла не было)
+
 
         # Undo-стек (простой список состояний)
         self._undo_stack = []
@@ -2627,12 +2635,26 @@ class SmetaMainWindow(QMainWindow):
             self.statusBar().showMessage(f"Ошибка сохранения черновика: {e}")
 
     def _load_draft(self):
+        """Загружает черновик сметы и запоминает его состояние на момент запуска.
+
+        Снимок файла нужен для режима «Выйти без сохранения»: автосохранение
+        пишет черновик при каждом изменении, поэтому без отката к снимку
+        отмена сохранения не имела бы эффекта.
+        """
         draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        self._startup_draft_path = draft_path
+        self._startup_draft_snapshot = None
         if not os.path.exists(draft_path):
             return
         try:
-            with open(draft_path, 'r', encoding='utf-8') as f:
-                draft = json.load(f)
+            with open(draft_path, 'rb') as f:
+                self._startup_draft_snapshot = f.read()
+        except Exception:
+            # Не удалось прочитать — откат при выходе будет запрещён
+            self._startup_draft_path = None
+            return
+        try:
+            draft = json.loads(self._startup_draft_snapshot.decode('utf-8'))
             current = draft.get('current_state')
             if current is None:
                 return
@@ -2640,6 +2662,29 @@ class SmetaMainWindow(QMainWindow):
             self.statusBar().showMessage("Черновик восстановлен")
         except Exception as e:
             self.statusBar().showMessage(f"Ошибка загрузки черновика: {e}")
+
+    def _restore_startup_draft(self):
+        """Откатывает файл черновика к состоянию на момент запуска приложения.
+
+        Вызывается при закрытии окна, если пользователь выбрал «Выйти без
+        сохранения». Если на старте файла черновика не было, он удаляется.
+        """
+        draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        if self._startup_draft_path is None:
+            return
+        # База данных в этом сеансе менялась — черновик стартовой базы трогать нельзя
+        if os.path.normcase(draft_path) != os.path.normcase(self._startup_draft_path):
+            return
+        try:
+            if self._startup_draft_snapshot is None:
+                if os.path.exists(draft_path):
+                    os.remove(draft_path)
+            else:
+                with open(draft_path, 'wb') as f:
+                    f.write(self._startup_draft_snapshot)
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка отката черновика: {e}")
+
 
     # =======================================================================
     # Экспорт / Импорт
@@ -2713,7 +2758,18 @@ class SmetaMainWindow(QMainWindow):
     # Закрытие
     # =======================================================================
     def closeEvent(self, event):
-        self._save_draft()
+        """Сохраняет черновик и состояние окна при закрытии.
+
+        Если выбран режим «Выйти без сохранения» (`_skip_draft_save_on_close`),
+        черновик не сохраняется, а файл откатывается к состоянию на момент
+        запуска. Параметры интерфейса (ширины колонок, геометрия, настройки)
+        и база данных сохраняются в любом случае.
+        """
+        if self._skip_draft_save_on_close:
+            self._restore_startup_draft()
+        else:
+            self._save_draft()
+        self._skip_draft_save_on_close = False
         self._save_column_widths()
         self._save_window_geometry()
         self._save_settings()
@@ -2721,6 +2777,7 @@ class SmetaMainWindow(QMainWindow):
             self.db_mgr.flush()
             self.db_mgr.close()
         event.accept()
+
 
     # =======================================================================
     # Слоты
@@ -2994,8 +3051,8 @@ class SmetaMainWindow(QMainWindow):
     # =======================================================================
     def _show_about(self):
         QMessageBox.about(
-            self, "О программе — Сметчик PRO 5.4.0",
-            "Сметчик PRO 5.4.0\n\n"
+            self, f"О программе — {APP_TITLE}",
+            f"{APP_TITLE}\n\n"
             "Приложение для составления смет с поддержкой двух вариантов цены.\n\n"
             "Автор: Крезуб Павел (@pto_plus) | Лицензия: MIT\n\n"
             "Технологии: Python 3, PyQt6, SQLite, pandas, openpyxl, xlsxwriter, python_calamine\n\n"
@@ -3247,7 +3304,7 @@ def _load_app_icon() -> QIcon:
 
 
 def main():
-    """Запускает приложение «Сметчик PRO 5.4.0»."""
+    """Запускает приложение «Сметчик PRO» (версия — в константе APP_VERSION)."""
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     icon = _load_app_icon()
