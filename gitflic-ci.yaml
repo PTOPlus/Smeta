@@ -12,8 +12,10 @@ stages:
 sync_github:
   stage: sync
   script:
+    - test -n "${GITHUB_TOKEN}" && echo "Token is set" || (echo "Token is EMPTY" && exit 1)
     - git config --global user.name "GitFlic CI"
     - git config --global user.email "ci@gitflic.com"
+    - rm -rf /tmp/mirror && mkdir -p /tmp/mirror
     - git clone --mirror "https://github.com/PTOPlus/Smeta.git" /tmp/mirror
     - cd /tmp/mirror
     - git push --mirror "https://x-access-token:${GITHUB_TOKEN}@github.com/PTOPlus/Smeta.git"
