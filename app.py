@@ -39,7 +39,7 @@ from db_manager import DatabaseManager
 # Название и версия приложения. Единственное место, где задаётся номер версии:
 # заголовок окна, диалог «О программе» и другие надписи берут значения отсюда.
 APP_NAME = "Сметчик PRO"
-APP_VERSION = "5.4.1"
+APP_VERSION = "5.4.2"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 DRAFT_FILE = "smeta_draft.json"
@@ -667,6 +667,11 @@ class SmetaMainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         
+        self.koeff_label = QLabel()
+        self.koeff_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.koeff_label.setStyleSheet("QLabel { font-size: 12px; color: #555; }")
+        btn_row.addWidget(self.koeff_label)
+
         self.datetime_label = QLabel()
         self.datetime_label.setFixedWidth(180)
         self.datetime_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -694,6 +699,7 @@ class SmetaMainWindow(QMainWindow):
         self._load_column_widths()
 
         # --- Обновление даты/времени ---
+        self._update_koeff_label()
         self._update_datetime()
         self.datetime_timer = self.startTimer(1000)
 
@@ -706,6 +712,10 @@ class SmetaMainWindow(QMainWindow):
         """Обновляет метку с текущими датой и временем."""
         now = datetime.now()
         self.datetime_label.setText(now.strftime("%d.%m.%Y %H:%M:%S"))
+
+    def _update_koeff_label(self):
+        """Обновляет метку с текущим коэффициентом цены из настроек."""
+        self.koeff_label.setText(f"Текущее значение  k={self.koeff_price:g}")
 
     # =======================================================================
     # Меню
@@ -1502,7 +1512,8 @@ class SmetaMainWindow(QMainWindow):
         """Переносит выделенные позиции из сплит-формы в справочник материалов.
 
         Для каждой выделенной строки создаёт или обновляет материал:
-        name, unit из сплит-формы; price_1 = price_2 = price_vat (с НДС 22%).
+        name, unit из сплит-формы; price_2 = price_vat (с НДС 22%),
+        price_1 = price_2 * koeff_price (коэффициент k из настроек).
         """
         sel = self.split_table.selectionModel().selectedRows()
         if not sel:
@@ -1517,11 +1528,12 @@ class SmetaMainWindow(QMainWindow):
             name = str(rec['name']).strip()
             if not name:
                 continue
+            price_vat = float(rec['price_vat'] or 0.0)
             items.append({
                 'name': name,
                 'unit': str(rec['unit']).strip(),
-                'price_1': float(rec['price_vat'] or 0.0),
-                'price_2': float(rec['price_vat'] or 0.0),
+                'price_1': round(price_vat * self.koeff_price, 2),
+                'price_2': price_vat,
             })
 
         if not items:
@@ -3092,6 +3104,7 @@ class SmetaMainWindow(QMainWindow):
             if export:
                 self.export_folder = export
             self.koeff_price = koeff
+            self._update_koeff_label()
             self._save_settings()
             self.statusBar().showMessage("Настройки сохранены")
 
