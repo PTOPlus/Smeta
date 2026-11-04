@@ -18,6 +18,6 @@ sync_github:
     - rm -rf /tmp/mirror && mkdir -p /tmp/mirror
     - git clone --mirror "https://github.com/PTOPlus/Smeta.git" /tmp/mirror
     - cd /tmp/mirror
-    - git push "https://x-access-token:${GITHUB_TOKEN}@://github.com/PTOPlus/Smeta.git" --all
-    - git push "https://x-access-token:${GITHUB_TOKEN}@://github.com/PTOPlus/Smeta.git" --tags
+    - git push "https://x-access-token:${GITHUB_TOKEN}@github.com/PTOPlus/Smeta.git" --all
+    - git push "https://x-access-token:${GITHUB_TOKEN}@github.com/PTOPlus/Smeta.git" --tags
   when: manual
