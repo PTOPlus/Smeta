@@ -15,6 +15,6 @@ sync_github:
     - git config --global user.name "GitFlic CI"
     - git config --global user.email "ci@gitflic.com"
     - git remote add github "https://x-access-token:${GITHUB_TOKEN}@github.com/PTOPlus/Smeta.git"
-    - git push github --all --force
+    - git push github HEAD:master --force
     - git push github --tags --force
   when: manual
