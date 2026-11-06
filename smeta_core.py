@@ -10,6 +10,7 @@ from xlsxwriter.utility import xl_rowcol_to_cell as RC
 COLS = ['Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм',
         'Расход_1', 'Цена_мат_1', 'Цена_раб_1',
         'Расход_2', 'Цена_мат_2', 'Цена_раб_2']
+META_COLS = COLS + ['Округл_вверх']
 LEGACY_COLS = ['Работа', 'Ед_изм_раб', 'Материал', 'Ед_изм', 'Расход', 'Цена_мат', 'Цена_раб']
 CALC_HEADERS = ("№", "Наименование", "Ед. изм.",
                 "Норма В1", "Объём В1", "Цена В1", "Стоимость В1",
@@ -634,6 +635,104 @@ def parse_exported_sheet(sheet_values):
         'sequence': sequence,
     }
 
+def _meta_flag(val) -> bool:
+    """Интерпретирует значение ячейки флага округления (1/0, 'Да'/'Нет') как bool.
+
+    Args:
+        val: значение ячейки (int, float, str или None).
+
+    Returns:
+        bool: True, если значение означает «округлять вверх».
+    """
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "да", "yes", "true", "x", "+", "округл")
+    return to_float(val) >= 1.0
+
+def parse_meta_sheet(sheet_values):
+    """Разбирает служебный лист 'Meta' ранее экспортированной сметы.
+
+    Лист пишется в «парном» формате: одна строка = работа + один её материал
+    с нормами расхода и ценами. Работа без материалов задаётся строкой, где
+    в колонке 'Материал' стоит '-'. Функция возвращает плоский список связей,
+    из которого восстанавливается справочник (работы, материалы, нормы).
+
+    Колонки определяются по строке-шапке; при отсутствии заголовка берётся
+    стандартный порядок META_COLS (обратная совместимость со старыми файлами,
+    где колонки 'Округл_вверх' нет вовсе).
+
+    Args:
+        sheet_values: двумерный список значений ячеек листа 'Meta'.
+
+    Returns:
+        list[dict]: записи со ключами 'work', 'work_unit', 'work_price_1',
+            'work_price_2', 'material', 'mat_unit', 'mat_price_1',
+            'mat_price_2', 'consumption_1', 'consumption_2', 'round_up'.
+            Пустой список, если лист не распознан.
+    """
+    if not sheet_values:
+        return []
+
+    def cell_text(val):
+        if val is None:
+            return ""
+        if isinstance(val, float) and math.isnan(val):
+            return ""
+        return str(val).strip()
+
+    # Строка-шапка ищется по колонке 'Работа'.
+    header_idx = None
+    col_map = {}
+    for i, row in enumerate(sheet_values[:10]):
+        if not row:
+            continue
+        cells = [cell_text(c) for c in row]
+        if "Работа" in cells:
+            header_idx = i
+            for c_idx, name in enumerate(cells):
+                if name and name not in col_map:
+                    col_map[name] = c_idx
+            break
+    if header_idx is None:
+        return []
+
+    def get(row, name):
+        idx = col_map.get(name)
+        if idx is None:
+            idx = META_COLS.index(name) if name in META_COLS else None
+        if idx is None or idx >= len(row):
+            return None
+        return row[idx]
+
+    records = []
+    seen = set()
+    for row in sheet_values[header_idx + 1:]:
+        if not row:
+            continue
+        work_name = cell_text(get(row, 'Работа'))
+        if not work_name or work_name.lower() in EMPTY_TOKENS:
+            continue
+        mat_name = cell_text(get(row, 'Материал'))
+        if mat_name.lower() in EMPTY_TOKENS:
+            mat_name = ""
+        key = (work_name, mat_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({
+            'work': work_name,
+            'work_unit': cell_text(get(row, 'Ед_изм_раб')),
+            'work_price_1': to_float(get(row, 'Цена_раб_1')),
+            'work_price_2': to_float(get(row, 'Цена_раб_2')),
+            'material': mat_name,
+            'mat_unit': cell_text(get(row, 'Ед_изм')),
+            'mat_price_1': to_float(get(row, 'Цена_мат_1')),
+            'mat_price_2': to_float(get(row, 'Цена_мат_2')),
+            'consumption_1': to_float(get(row, 'Расход_1')),
+            'consumption_2': to_float(get(row, 'Расход_2')),
+            'round_up': _meta_flag(get(row, 'Округл_вверх')),
+        })
+    return records
+
 # --------------------------------------------------------------------------
 # Экспорт в Excel
 # --------------------------------------------------------------------------
@@ -659,7 +758,7 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
         output_path (str): путь к создаваемому XLSX-файлу.
         title (str): название сметы. По умолчанию "Смета".
         meta_rows (list, optional): список метаданных для листа Meta.
-            Каждая строка — список из 10 значений в формате COLS.
+            Каждая строка — список из 10 или 11 значений в формате META_COLS.
         overhead1 (float): накладные расходы вариант 1.
         overhead2 (float): накладные расходы вариант 2.
         lift1 (float): подъёмные механизмы вариант 1.
@@ -839,10 +938,13 @@ def export_smeta_to_excel(rows, output_path, title="", meta_rows=None,
             i += 1
 
     if meta_rows:
-        meta_df = pd.DataFrame(meta_rows, columns=COLS).drop_duplicates().reset_index(drop=True)
+        # Строки могут быть в старом 10-колоночном формате (COLS) —
+        # дополняем их флагом округления до META_COLS.
+        padded = [list(r) + [0] * (len(META_COLS) - len(r)) for r in meta_rows]
+        meta_df = pd.DataFrame(padded, columns=META_COLS).drop_duplicates().reset_index(drop=True)
         if not meta_df.empty:
             ws_meta = wb.add_worksheet("Meta")
-            for c, h in enumerate(COLS):
+            for c, h in enumerate(META_COLS):
                 ws_meta.write(0, c, h)
             for r_idx, row in enumerate(meta_df.itertuples(index=False), start=1):
                 for c_idx, val in enumerate(row):

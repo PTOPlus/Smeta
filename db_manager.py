@@ -635,6 +635,21 @@ class DatabaseManager:
 
         self.work_materials_dirty = True
 
+    def has_work_material_link(self, work_id: int, material_id: int) -> bool:
+        """Проверяет, существует ли связь между работой и материалом.
+
+        Args:
+            work_id (int): id работы.
+            material_id (int): id материала.
+
+        Returns:
+            bool: True, если связь уже есть в кэше.
+        """
+        if self.work_materials_cache is None or self.work_materials_cache.empty:
+            return False
+        mask = (self.work_materials_cache['work_id'] == work_id) & (self.work_materials_cache['material_id'] == material_id)
+        return bool(mask.any())
+
     def remove_work_material_link(self, work_id: int, material_id: int):
         """Удаляет связь между конкретной работой и материалом.
         

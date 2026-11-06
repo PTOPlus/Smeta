@@ -25,7 +25,7 @@ from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut, QColor
 
 from smeta_core import (
     build_work_block, rebuild_smeta, resync_smeta_with_db, compute_grand_totals,
-    export_smeta_to_excel, parse_exported_sheet,
+    export_smeta_to_excel, parse_exported_sheet, parse_meta_sheet,
     to_float, apply_price_koeff, is_section, is_work, is_total, is_material, clean_name,
     SECTION_PREFIX, WORK_PREFIX, TOTAL_PREFIX,
     CALC_HEADERS, COLS,
@@ -39,7 +39,7 @@ from db_manager import DatabaseManager
 # Название и версия приложения. Единственное место, где задаётся номер версии:
 # заголовок окна, диалог «О программе» и другие надписи берут значения отсюда.
 APP_NAME = "Сметчик PRO"
-APP_VERSION = "5.4.2"
+APP_VERSION = "5.4.3"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 DRAFT_FILE = "smeta_draft.json"
@@ -2709,6 +2709,13 @@ class SmetaMainWindow(QMainWindow):
         QMessageBox.information(self, "Экспорт", "Смета экспортирована успешно.")
 
     def _import_from_excel(self):
+        """Загружает смету из ранее экспортированного Excel-файла.
+
+        Читает лист «Смета» (структура сметы) и, если он есть, служебный лист
+        «Meta» — пары «работа + материал» с нормами расхода и ценами. По листу
+        Meta в справочник добавляются отсутствующие работы, материалы и связи,
+        поэтому блоки импортируемых работ собираются вместе с материалами.
+        """
         path, _ = QFileDialog.getOpenFileName(
             self, "Выберите файл Excel", self.export_folder, "Excel (*.xlsx)"
         )
@@ -2728,6 +2735,15 @@ class SmetaMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", "Не удалось распознать строки сметы.")
                 return
 
+            # Справочник пополняем до сборки блоков: build_work_block берёт
+            # материалы и нормы именно из него.
+            meta_stats = None
+            if "Meta" in wb.sheetnames:
+                meta_values = [list(row) for row in wb["Meta"].iter_rows(values_only=True)]
+                meta_records = parse_meta_sheet(meta_values)
+                if meta_records:
+                    meta_stats = self._restore_reference_from_meta(meta_records)
+
             self.smeta_rows = []
             self.sections = []
             self.smeta_title = parsed['title'] if parsed['title'] else "Смета"
@@ -2744,6 +2760,7 @@ class SmetaMainWindow(QMainWindow):
                 self.extra_betonopump1, self.extra_betonopump2 = parsed['betonopump']
             self._update_extra_table()
 
+            skipped = []
             for item in seq:
                 if item[0] == 'section':
                     self.sections.append(item[1])
@@ -2751,6 +2768,8 @@ class SmetaMainWindow(QMainWindow):
                     block = build_work_block(item[1], item[2], None, len(self.smeta_rows) + 1, self.db_mgr)
                     if block:
                         self.smeta_rows.extend(block)
+                    elif item[1] not in skipped:
+                        skipped.append(item[1])
 
             self.smeta_rows = rebuild_smeta(self.smeta_rows)
             self._update_table_from_rows()
@@ -2762,9 +2781,72 @@ class SmetaMainWindow(QMainWindow):
             self._refresh_link_works_combo()
 
             self.statusBar().showMessage(f"Импорт: {path}")
-            QMessageBox.information(self, "Импорт", f"Смета импортирована:\n{path}")
+            msg = f"Смета импортирована:\n{path}"
+            if meta_stats:
+                w_added, m_added, l_added = meta_stats
+                if w_added or m_added or l_added:
+                    msg += ("\n\nПо листу Meta добавлено в справочник:\n"
+                            f"  работ — {w_added}, материалов — {m_added}, связей — {l_added}")
+                else:
+                    msg += "\n\nЛист Meta: справочник уже содержит все связи."
+            else:
+                msg += "\n\nЛист Meta отсутствует — связи не восстанавливались."
+            if skipped:
+                shown = ", ".join(skipped[:5])
+                if len(skipped) > 5:
+                    shown += f" … (+{len(skipped) - 5})"
+                msg += f"\n\nНет в справочнике, пропущено ({len(skipped)}): {shown}"
+            QMessageBox.information(self, "Импорт", msg)
         except Exception as e:
             QMessageBox.critical(self, "Ошибка импорта", str(e))
+
+    def _restore_reference_from_meta(self, records):
+        """Пополняет справочник по служебному листу Meta.
+
+        Добавляет отсутствующие работы и материалы и создаёт недостающие связи
+        работа→материал с нормами расхода из файла. Существующие записи не
+        изменяются: цены и нормы справочника остаются источником актуальных
+        значений для пересчёта сметы.
+
+        Args:
+            records (list[dict]): записи, возвращённые parse_meta_sheet().
+
+        Returns:
+            tuple(int, int, int): (работ добавлено, материалов добавлено,
+                связей создано).
+        """
+        works_added = materials_added = links_added = 0
+
+        for rec in records:
+            work_name = rec['work']
+            work = self.db_mgr.get_work_by_name(work_name)
+            if work is None:
+                wp1 = apply_price_koeff(rec['work_price_1'], rec['work_price_2'], self.koeff_price)
+                work_id = self.db_mgr.add_work(work_name, rec['work_unit'], wp1, rec['work_price_2'])
+                works_added += 1
+            else:
+                work_id = int(work['id'])
+
+            mat_name = rec['material']
+            if not mat_name:
+                continue
+            mat = self.db_mgr.get_material_by_name(mat_name)
+            if mat is None:
+                mp1 = apply_price_koeff(rec['mat_price_1'], rec['mat_price_2'], self.koeff_price)
+                mat_id = self.db_mgr.add_material(mat_name, rec['mat_unit'], mp1, rec['mat_price_2'])
+                materials_added += 1
+            else:
+                mat_id = int(mat['id'])
+
+            if self.db_mgr.has_work_material_link(work_id, mat_id):
+                continue
+            self.db_mgr.add_work_material_link(work_id, mat_id, rec['consumption_1'],
+                                               rec['consumption_2'], rec['round_up'])
+            links_added += 1
+
+        if works_added or materials_added or links_added:
+            self.db_mgr.flush()
+        return works_added, materials_added, links_added
 
     # =======================================================================
     # Закрытие
@@ -3248,6 +3330,7 @@ class SmetaMainWindow(QMainWindow):
             # Meta пишется в парном формате: одна строка = работа + один её материал.
             # Это позволяет при импорте восстановить связи работа→материал
             # (нормы расхода хранятся в паре). Работа без материалов — строка с "-".
+            # Последний столбец — флаг округления объёма материалов вверх.
             meta_rows = []
             rows = self.smeta_rows
             n = len(rows)
@@ -3265,11 +3348,12 @@ class SmetaMainWindow(QMainWindow):
                         mats.append(rows[j])
                         j += 1
                     if not mats:
-                        meta_rows.append([work_name, unit_w, "-", "-", "-", 0, wp1, "-", 0, wp2])
+                        meta_rows.append([work_name, unit_w, "-", "-", "-", 0, wp1, "-", 0, wp2, 0])
                     else:
                         for m in mats:
+                            round_up = 1 if (len(m) > 11 and m[11]) else 0
                             meta_rows.append([work_name, unit_w, clean_name(m[1]), str(m[2]).strip(),
-                                              m[3], m[5], wp1, m[7], m[9], wp2])
+                                              m[3], m[5], wp1, m[7], m[9], wp2, round_up])
                     i = j
                     continue
                 i += 1
