@@ -719,6 +719,88 @@ class DatabaseManager:
         self.split_prices_dirty = True
         return len(self.split_prices_cache)
 
+    def update_split_prices_incremental(self, records: list) -> Dict:
+        """Инкрементально обновляет справочник цен из сплит-формы.
+
+        Сравнивает записи по уникальному полю ``code``: добавляет новые
+        позиции, обновляет изменённые, удаляет отсутствующие в файле.
+        Пересчитывает ``id`` после обновлений.
+
+        Args:
+            records (list[dict]): новые записи из сплит-формы с ключами
+                code, name, unit, price_no_vat, price_vat, kind,
+                group_code, group_name.
+
+        Returns:
+            dict: статистика обновлений ``{added, updated, removed}``.
+        """
+        if self.split_prices_cache is None:
+            self.split_prices_cache = pd.DataFrame(columns=SPLIT_PRICES_COLS)
+
+        existing = self.split_prices_cache.copy()
+        stats = {'added': 0, 'updated': 0, 'removed': 0}
+
+        # Индекс по code для быстрого поиска
+        existing_by_code = {}
+        if not existing.empty:
+            for _, row in existing.iterrows():
+                code = str(row['code']).strip()
+                if code and code not in existing_by_code:
+                    existing_by_code[code] = row
+
+        incoming_codes = set()
+
+        if records:
+            for rec in records:
+                code = str(rec.get('code', '')).strip()
+                if not code:
+                    continue
+                incoming_codes.add(code)
+
+                if code in existing_by_code:
+                    # Обновление существующей записи
+                    idx = existing_by_code[code]['id']
+                    mask = self.split_prices_cache['id'] == idx
+                    for col in ('name', 'unit', 'price_no_vat', 'price_vat',
+                                'kind', 'group_code', 'group_name'):
+                        self.split_prices_cache.loc[mask, col] = rec.get(col, '')
+                    stats['updated'] += 1
+                else:
+                    # Новая запись
+                    new_id = int(self.split_prices_cache['id'].max()) + 1 \
+                        if not self.split_prices_cache.empty else 1
+                    new_row = pd.DataFrame([{
+                        'id': new_id,
+                        'code': code,
+                        'name': str(rec.get('name', '')),
+                        'unit': str(rec.get('unit', '')),
+                        'price_no_vat': float(rec.get('price_no_vat', 0) or 0),
+                        'price_vat': float(rec.get('price_vat', 0) or 0),
+                        'kind': str(rec.get('kind', '')),
+                        'group_code': str(rec.get('group_code', '')),
+                        'group_name': str(rec.get('group_name', '')),
+                    }])
+                    self.split_prices_cache = pd.concat(
+                        [self.split_prices_cache, new_row], ignore_index=True)
+                    stats['added'] += 1
+
+        # Удаление записей, которых нет в файле
+        if not existing.empty:
+            mask = self.split_prices_cache['code'].astype(str).str.strip().isin(
+                [c for c in incoming_codes if c])
+            removed_ids = self.split_prices_cache[~mask]['id'].tolist()
+            if removed_ids:
+                self.split_prices_cache = self.split_prices_cache[
+                    ~self.split_prices_cache['id'].isin(removed_ids)]
+                stats['removed'] = len(removed_ids)
+
+        # Пересчёт id (сохраняем последовательность 1..N)
+        if not self.split_prices_cache.empty:
+            self.split_prices_cache['id'] = range(1, len(self.split_prices_cache) + 1)
+
+        self.split_prices_dirty = True
+        return stats
+
     def save_split_prices_now(self):
         """Заменяет таблицу split_prices в SQLite прямым пакетным INSERT.
 

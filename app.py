@@ -39,7 +39,7 @@ from db_manager import DatabaseManager
 # Название и версия приложения. Единственное место, где задаётся номер версии:
 # заголовок окна, диалог «О программе» и другие надписи берут значения отсюда.
 APP_NAME = "Сметчик PRO"
-APP_VERSION = "5.4.3"
+APP_VERSION = "5.4.4"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 DRAFT_FILE = "smeta_draft.json"
@@ -1081,6 +1081,9 @@ class SmetaMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть базу данных:\n{e}")
             return
+        # Обновляем снимок черновика для новой базы: читаем файл (если есть)
+        # для корректной работы «Выйти без сохранения» после переключения.
+        self._refresh_startup_draft_snapshot()
         self._save_settings()
         self._refresh_db_list()
         self._refresh_works_table()
@@ -1431,15 +1434,20 @@ class SmetaMainWindow(QMainWindow):
         self.statusBar().showMessage("Сохранение в базу...")
         QApplication.processEvents()
 
-        # Сохраняем в базу быстрым пакетным путём
-        self.db_mgr.set_split_prices(records)
+        # Инкрементальное обновление: добавление новых, обновление изменённых,
+        # удаление отсутствующих в файле. Значительно быстрее полной замены
+        # для больших справочников (47k+ строк).
+        inc_stats = self.db_mgr.update_split_prices_incremental(records)
         self.db_mgr.save_split_prices_now()
 
         self._refresh_split_view()
         msg = (f"Загружено записей: {stats['imported']:,}\n"
                f"Пропущено тарифов на перевозку: {stats['transport']:,}\n"
                f"Пропущено оплаты труда: {stats['labor']:,}\n"
-               f"Без цены (прочерки): {stats['no_price']:,}")
+               f"Без цены (прочерки): {stats['no_price']:,}\n\n"
+               f"Обновлено: {inc_stats['updated']}\n"
+               f"Добавлено: {inc_stats['added']}\n"
+               f"Удалено: {inc_stats['removed']}")
         self.statusBar().showMessage(
             f"Сплит-форма: {stats['imported']:,} записей с НДС 22%"
         )
@@ -2622,11 +2630,6 @@ class SmetaMainWindow(QMainWindow):
     def _save_draft(self):
         draft_path = os.path.join(self.db_folder, DRAFT_FILE)
         try:
-            prev_state = {}
-            if os.path.exists(draft_path):
-                with open(draft_path, 'r', encoding='utf-8') as f:
-                    prev_state = json.load(f)
-
             current_state = {
                 'rows': [list(r) for r in self.smeta_rows],
                 'title': self.smeta_title,
@@ -2637,7 +2640,6 @@ class SmetaMainWindow(QMainWindow):
                           self.extra_betonopump1, self.extra_betonopump2),
             }
             draft = {
-                'prev_state': prev_state,
                 'current_state': current_state,
                 'timestamp': datetime.now().isoformat(),
             }
@@ -2679,16 +2681,14 @@ class SmetaMainWindow(QMainWindow):
         """Откатывает файл черновика к состоянию на момент запуска приложения.
 
         Вызывается при закрытии окна, если пользователь выбрал «Выйти без
-        сохранения». Если на старте файла черновика не было, он удаляется.
+        сохранения». Если на старте файла черновика не было — он удаляется.
+        При переключении базы снимок обновляется в _switch_database, поэтому
+        откат всегда работает для текущей базы.
         """
         draft_path = os.path.join(self.db_folder, DRAFT_FILE)
-        if self._startup_draft_path is None:
-            return
-        # База данных в этом сеансе менялась — черновик стартовой базы трогать нельзя
-        if os.path.normcase(draft_path) != os.path.normcase(self._startup_draft_path):
-            return
         try:
             if self._startup_draft_snapshot is None:
+                # Файла не было на старте — удаляем черновик
                 if os.path.exists(draft_path):
                     os.remove(draft_path)
             else:
@@ -2696,6 +2696,26 @@ class SmetaMainWindow(QMainWindow):
                     f.write(self._startup_draft_snapshot)
         except Exception as e:
             self.statusBar().showMessage(f"Ошибка отката черновика: {e}")
+
+    def _refresh_startup_draft_snapshot(self):
+        """Обновляет снимок черновика для текущей базы данных.
+
+        Вызывается при переключении базы: читает файл черновика новой базы
+        (если он есть) в `_startup_draft_snapshot` и запоминает путь.
+        Это обеспечивает корректную работу «Выйти без сохранения» после
+        смены базы в том же сеансе.
+        """
+        draft_path = os.path.join(self.db_folder, DRAFT_FILE)
+        self._startup_draft_path = draft_path
+        self._startup_draft_snapshot = None
+        if os.path.exists(draft_path):
+            try:
+                with open(draft_path, 'rb') as f:
+                    self._startup_draft_snapshot = f.read()
+            except Exception:
+                # Не удалось прочитать — снимок остаётся None,
+                # при выходе черновик будет удалён
+                pass
 
 
     # =======================================================================
@@ -2744,6 +2764,7 @@ class SmetaMainWindow(QMainWindow):
                 if meta_records:
                     meta_stats = self._restore_reference_from_meta(meta_records)
 
+            self._push_undo_state()
             self.smeta_rows = []
             self.sections = []
             self.smeta_title = parsed['title'] if parsed['title'] else "Смета"
@@ -2908,6 +2929,7 @@ class SmetaMainWindow(QMainWindow):
             row (int): индекс изменённой строки (не используется, читаются все строки).
             col (int): индекс изменённой колонки (не используется, читаются все колонки).
         """
+        self._push_undo_state()
         self.extra_overhead1 = to_float(self.extra_table.item(0, 1).text())
         self.extra_overhead2 = to_float(self.extra_table.item(0, 2).text())
         self.extra_lifting1 = to_float(self.extra_table.item(1, 1).text())
@@ -3223,7 +3245,8 @@ class SmetaMainWindow(QMainWindow):
             'sections': list(self.sections),
             'extra': (self.extra_overhead1, self.extra_overhead2,
                       self.extra_lifting1, self.extra_lifting2,
-                      self.extra_trash1, self.extra_trash2),
+                      self.extra_trash1, self.extra_trash2,
+                      self.extra_betonopump1, self.extra_betonopump2),
         })
         self._restore_state(state)
         self.statusBar().showMessage("Действие отменено (Ctrl+Z)")
@@ -3244,7 +3267,8 @@ class SmetaMainWindow(QMainWindow):
             'sections': list(self.sections),
             'extra': (self.extra_overhead1, self.extra_overhead2,
                       self.extra_lifting1, self.extra_lifting2,
-                      self.extra_trash1, self.extra_trash2),
+                      self.extra_trash1, self.extra_trash2,
+                      self.extra_betonopump1, self.extra_betonopump2),
         })
         self._restore_state(state)
         self.statusBar().showMessage("Действие повторено (Ctrl+Y)")

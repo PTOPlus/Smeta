@@ -1,4 +1,4 @@
-# Сметчик PRO 5.4.3
+# Сметчик PRO 5.4.4
 
    Программа для составления смет с поддержкой двух вариантов цены
 
@@ -60,6 +60,6 @@
    📦 ЗАВИСИМОСТИ
          pip install pandas openpyxl xlsxwriter PyQt6 python_calamine pillow
 
-   Версия: 5.4.3
+    Версия: 5.4.4
    Разработчик: @pto_plus
    Поддержка: <vremyanca@list.ru>
